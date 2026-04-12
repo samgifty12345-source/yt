@@ -1,16 +1,14 @@
 """
-YouTube Auto Uploader — Render Edition
-----------------------------------------
-Reads videos.csv, downloads each pending video, uploads to YouTube,
-then marks it as done in a done.txt log so it never re-uploads.
+YouTube Auto Uploader — Render Edition (with cookie auth)
+----------------------------------------------------------
+Reads videos.csv, downloads each pending video using YouTube cookies
+to bypass bot detection, uploads to YouTube, then marks as done.
 
-Environment variables (already set in Render):
+Environment variables required in Render:
   YOUTUBE_CLIENT_ID      → your OAuth client ID
   YOUTUBE_CLIENT_SECRET  → your OAuth client secret
-  YOUTUBE_REFRESH_TOKEN  → your refresh token (generated once, see README)
-
-Run manually or as a Render Cron Job:
-  python uploader.py
+  YOUTUBE_REFRESH_TOKEN  → your refresh token
+  YOUTUBE_COOKIES        → full contents of your cookies.txt file
 """
 
 import os
@@ -29,11 +27,24 @@ from googleapiclient.http import MediaFileUpload
 CSV_FILE     = "videos.csv"
 DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
+COOKIES_FILE = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def write_cookies_file():
+    """Write YOUTUBE_COOKIES env var content to a temp cookies.txt file."""
+    cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if not cookies:
+        print("⚠️  YOUTUBE_COOKIES env var not set — downloads may fail.\n")
+        return None
+    with open(COOKIES_FILE, "w") as f:
+        f.write(cookies)
+    print("✅  Cookies loaded\n")
+    return COOKIES_FILE
+
+
 def get_youtube_client():
-    """Build YouTube API client using env var credentials (no browser needed)."""
+    """Build YouTube API client using env var credentials."""
     client_id     = os.environ.get("YOUTUBE_CLIENT_ID")
     client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET")
     refresh_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
@@ -51,7 +62,6 @@ def get_youtube_client():
         client_secret=client_secret,
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
-
     creds.refresh(Request())
     print("✅  Authenticated with YouTube API\n")
     return build("youtube", "v3", credentials=creds)
@@ -69,7 +79,7 @@ def mark_done(url: str):
         f.write(url + "\n")
 
 
-def download_video(url: str) -> str | None:
+def download_video(url: str, cookies_file: str) -> str | None:
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
@@ -77,6 +87,10 @@ def download_video(url: str) -> str | None:
         "quiet": True,
         "no_warnings": True,
     }
+    # Add cookies if available
+    if cookies_file and os.path.exists(cookies_file):
+        ydl_opts["cookiefile"] = cookies_file
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -126,8 +140,9 @@ def main():
         print(f"❌  {CSV_FILE} not found.")
         sys.exit(1)
 
-    youtube = get_youtube_client()
-    done    = load_done()
+    cookies_file = write_cookies_file()
+    youtube      = get_youtube_client()
+    done         = load_done()
 
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
@@ -150,7 +165,7 @@ def main():
         print(f"  🔗  {url}")
         print("  ⬇️  Downloading...")
 
-        file_path = download_video(url)
+        file_path = download_video(url, cookies_file)
         if not file_path or not os.path.exists(file_path):
             print("  ⚠️  Skipping.\n")
             continue
