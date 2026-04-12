@@ -1,14 +1,13 @@
 """
-YouTube Auto Uploader — Runs forever
-- Every hour, posts ALL videos in videos.csv one by one
-- Never skips, never exits
-- Add new videos to CSV anytime — they get posted next round
+YouTube Auto Uploader — Runs forever with dummy web server
 """
 
 import os
 import csv
 import time
 import tempfile
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import gdown
 from google.oauth2.credentials import Credentials
@@ -18,7 +17,22 @@ from googleapiclient.http import MediaFileUpload
 
 CSV_FILE     = "videos.csv"
 DOWNLOAD_DIR = tempfile.gettempdir()
-WAIT_SECONDS = 3600  # 1 hour between each video
+WAIT_SECONDS = 3600
+
+
+# Dummy server to keep Render happy
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def log_message(self, *args):
+        pass  # silence logs
+
+def start_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    server.serve_forever()
 
 
 def get_youtube_client():
@@ -76,7 +90,7 @@ def upload_video(youtube, file_path, title, description, category_id, privacy):
         return None
 
 
-def main():
+def bot_loop():
     youtube = get_youtube_client()
     print("🤖  Bot is running. Posts 1 video per hour forever.\n")
 
@@ -84,7 +98,7 @@ def main():
         videos = load_videos()
 
         if not videos:
-            print("😴  No videos in CSV. Add some and I'll pick them up next hour.")
+            print("😴  No videos in CSV. Checking again in 1 hour...")
             time.sleep(WAIT_SECONDS)
             continue
 
@@ -118,6 +132,15 @@ def main():
 
             print(f"\n⏳  Waiting 1 hour before next video...\n")
             time.sleep(WAIT_SECONDS)
+
+
+def main():
+    # Start dummy web server in background thread
+    t = threading.Thread(target=start_server, daemon=True)
+    t.start()
+
+    # Run bot in main thread
+    bot_loop()
 
 
 if __name__ == "__main__":
