@@ -1,10 +1,11 @@
 """
-YouTube Auto Uploader — Google Drive Edition
-Downloads videos from Google Drive links in videos.csv and uploads to YouTube.
+YouTube Auto Uploader — Runs forever
+- Every hour, posts ALL videos in videos.csv one by one
+- Never skips, never exits
+- Add new videos to CSV anytime — they get posted next round
 """
 
 import os
-import sys
 import csv
 import time
 import tempfile
@@ -16,8 +17,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 CSV_FILE     = "videos.csv"
-DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
+WAIT_SECONDS = 3600  # 1 hour between each video
 
 
 def get_youtube_client():
@@ -34,16 +35,12 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def load_done():
-    if not os.path.exists(DONE_FILE):
-        return set()
-    with open(DONE_FILE) as f:
-        return set(line.strip() for line in f if line.strip())
-
-
-def mark_done(url):
-    with open(DONE_FILE, "a") as f:
-        f.write(url + "\n")
+def load_videos():
+    if not os.path.exists(CSV_FILE):
+        return []
+    with open(CSV_FILE, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    return [r for r in rows if r.get("drive_url", "").strip()]
 
 
 def download_from_drive(url):
@@ -81,51 +78,46 @@ def upload_video(youtube, file_path, title, description, category_id, privacy):
 
 def main():
     youtube = get_youtube_client()
-    done    = load_done()
+    print("🤖  Bot is running. Posts 1 video per hour forever.\n")
 
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    while True:
+        videos = load_videos()
 
-    pending = [r for r in rows if r["drive_url"].strip() not in done]
-    print(f"\n📋  {len(pending)} pending / {len(rows)} total\n")
-
-    if not pending:
-        print("✅  Nothing new. Add rows to videos.csv.")
-        return
-
-    for i, row in enumerate(pending, 1):
-        url         = row["drive_url"].strip()
-        title       = row.get("title", "Untitled").strip()
-        description = row.get("notes", "").strip()
-        category    = row.get("category_id", "24").strip()
-        privacy     = row.get("privacy", "public").strip().lower()
-
-        print(f"[{i}/{len(pending)}] {title}")
-        print(f"  ⬇️  Downloading from Drive...")
-
-        file_path = download_from_drive(url)
-        if not file_path:
-            print("  ❌  Skipping.\n")
+        if not videos:
+            print("😴  No videos in CSV. Add some and I'll pick them up next hour.")
+            time.sleep(WAIT_SECONDS)
             continue
 
-        size_mb = os.path.getsize(file_path) / (1024*1024)
-        print(f"  📦  {size_mb:.1f} MB")
+        print(f"📋  {len(videos)} video(s) in CSV\n")
 
-        vid = upload_video(youtube, file_path, title, description, category, privacy)
+        for i, row in enumerate(videos, 1):
+            url         = row["drive_url"].strip()
+            title       = row.get("title", "Untitled").strip()
+            description = row.get("notes", "").strip()
+            category    = row.get("category_id", "24").strip()
+            privacy     = row.get("privacy", "public").strip().lower()
 
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
+            print(f"[{i}/{len(videos)}] {title}")
+            print(f"  ⬇️  Downloading...")
 
-        if vid:
-            mark_done(url)
+            file_path = download_from_drive(url)
+            if not file_path:
+                print("  ❌  Skipping.\n")
+                time.sleep(WAIT_SECONDS)
+                continue
 
-        print()
-        if i < len(pending):
-            time.sleep(3)
+            size_mb = os.path.getsize(file_path) / (1024*1024)
+            print(f"  📦  {size_mb:.1f} MB")
 
-    print("🎉  Done!")
+            upload_video(youtube, file_path, title, description, category, privacy)
+
+            try:
+                os.remove(file_path)
+            except OSError:
+                pass
+
+            print(f"\n⏳  Waiting 1 hour before next video...\n")
+            time.sleep(WAIT_SECONDS)
 
 
 if __name__ == "__main__":
