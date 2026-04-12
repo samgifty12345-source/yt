@@ -1,14 +1,5 @@
 """
-YouTube Auto Uploader — Render Edition (with cookie auth)
-----------------------------------------------------------
-Reads videos.csv, downloads each pending video using YouTube cookies
-to bypass bot detection, uploads to YouTube, then marks as done.
-
-Environment variables required in Render:
-  YOUTUBE_CLIENT_ID      → your OAuth client ID
-  YOUTUBE_CLIENT_SECRET  → your OAuth client secret
-  YOUTUBE_REFRESH_TOKEN  → your refresh token
-  YOUTUBE_COOKIES        → full contents of your cookies.txt file
+YouTube Auto Uploader — Render Edition
 """
 
 import os
@@ -23,35 +14,30 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# ── Config ───────────────────────────────────────────────────────────────────
 CSV_FILE     = "videos.csv"
 DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
 COOKIES_FILE = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def write_cookies_file():
-    """Write YOUTUBE_COOKIES env var content to a temp cookies.txt file."""
     cookies = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if not cookies:
-        print("⚠️  YOUTUBE_COOKIES env var not set — downloads may fail.\n")
+        print("⚠️  YOUTUBE_COOKIES not set")
         return None
     with open(COOKIES_FILE, "w") as f:
         f.write(cookies)
-    print("✅  Cookies loaded\n")
+    print("✅  Cookies loaded")
     return COOKIES_FILE
 
 
 def get_youtube_client():
-    """Build YouTube API client using env var credentials."""
     client_id     = os.environ.get("YOUTUBE_CLIENT_ID")
     client_secret = os.environ.get("YOUTUBE_CLIENT_SECRET")
     refresh_token = os.environ.get("YOUTUBE_REFRESH_TOKEN")
 
     if not all([client_id, client_secret, refresh_token]):
-        print("❌  Missing one or more env vars:")
-        print("    YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, YOUTUBE_REFRESH_TOKEN")
+        print("❌  Missing YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET / YOUTUBE_REFRESH_TOKEN")
         sys.exit(1)
 
     creds = Credentials(
@@ -63,44 +49,60 @@ def get_youtube_client():
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
     creds.refresh(Request())
-    print("✅  Authenticated with YouTube API\n")
+    print("✅  Authenticated with YouTube API")
     return build("youtube", "v3", credentials=creds)
 
 
-def load_done() -> set:
+def load_done():
     if not os.path.exists(DONE_FILE):
         return set()
     with open(DONE_FILE, "r") as f:
         return set(line.strip() for line in f if line.strip())
 
 
-def mark_done(url: str):
+def mark_done(url):
     with open(DONE_FILE, "a") as f:
         f.write(url + "\n")
 
 
-def download_video(url: str, cookies_file: str) -> str | None:
-    ydl_opts = {
-        "format": "best[ext=mp4]/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-    }
-    # Add cookies if available
-    if cookies_file and os.path.exists(cookies_file):
-        ydl_opts["cookiefile"] = cookies_file
+def download_video(url, cookies_file):
+    """Try multiple format strategies until one works."""
+    formats_to_try = [
+        "best[ext=mp4]",
+        "best",
+        "worst",
+    ]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            path = ydl.prepare_filename(info)
-            if not path.endswith(".mp4"):
-                path = os.path.splitext(path)[0] + ".mp4"
-            return path
-    except Exception as e:
-        print(f"  ❌  Download failed: {e}")
-        return None
+    for fmt in formats_to_try:
+        ydl_opts = {
+            "format": fmt,
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        if cookies_file and os.path.exists(cookies_file):
+            ydl_opts["cookiefile"] = cookies_file
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # Find the actual downloaded file
+                video_id = info.get("id", "")
+                for f in os.listdir(DOWNLOAD_DIR):
+                    if video_id in f:
+                        full_path = os.path.join(DOWNLOAD_DIR, f)
+                        # Rename to .mp4 if needed
+                        if not full_path.endswith(".mp4"):
+                            new_path = os.path.splitext(full_path)[0] + ".mp4"
+                            os.rename(full_path, new_path)
+                            full_path = new_path
+                        return full_path
+        except Exception as e:
+            print(f"  ⚠️  Format '{fmt}' failed: {e}")
+            continue
+
+    return None
 
 
 def upload_video(youtube, file_path, title, description, category_id, privacy):
@@ -128,7 +130,7 @@ def upload_video(youtube, file_path, title, description, category_id, privacy):
             if status:
                 print(f"    ⬆️  Uploading... {int(status.progress() * 100)}%", end="\r")
         video_id = response.get("id")
-        print(f"    ✅  Done → https://youtube.com/watch?v={video_id}    ")
+        print(f"    ✅  Uploaded → https://youtube.com/watch?v={video_id}    ")
         return video_id
     except Exception as e:
         print(f"  ❌  Upload failed: {e}")
@@ -148,10 +150,10 @@ def main():
         rows = list(csv.DictReader(f))
 
     pending = [r for r in rows if r["url"].strip() not in done]
-    print(f"📋  {len(pending)} pending video(s) out of {len(rows)} total.\n")
+    print(f"\n📋  {len(pending)} pending / {len(rows)} total\n")
 
     if not pending:
-        print("✅  Nothing new to upload. Add more rows to videos.csv.")
+        print("✅  Nothing new to upload.")
         return
 
     for i, row in enumerate(pending, 1):
@@ -167,11 +169,11 @@ def main():
 
         file_path = download_video(url, cookies_file)
         if not file_path or not os.path.exists(file_path):
-            print("  ⚠️  Skipping.\n")
+            print("  ❌  All download attempts failed. Skipping.\n")
             continue
 
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        print(f"  📦  {size_mb:.1f} MB downloaded")
+        print(f"  📦  {size_mb:.1f} MB — uploading...")
 
         video_id = upload_video(youtube, file_path, title, description, category, privacy)
 
