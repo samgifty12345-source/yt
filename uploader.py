@@ -81,7 +81,7 @@ def mark_done(url: str):
 
 def download_video(url: str, cookies_file: str) -> str | None:
     ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "best[ext=mp4]/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
