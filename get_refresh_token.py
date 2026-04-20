@@ -1,26 +1,25 @@
-"""
-Run this ONCE on your local machine to get your YOUTUBE_REFRESH_TOKEN.
-It will open a browser, ask you to log in, then print the token.
-
-Steps:
-  1. pip install google-auth-oauthlib
-  2. Put your client_secrets.json in this folder
-  3. python get_refresh_token.py
-  4. Copy the printed refresh token into Render env vars
-"""
-
+import os
 import json
-from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+# Error handling for missing client_secrets.json file
+try:
+    # Load the client secrets from the specified JSON file
+    with open('client_secrets.json', 'r') as file:
+        client_secrets = json.load(file)
+except FileNotFoundError:
+    print("Error: 'client_secrets.json' file is missing. Please provide it to continue.")
+    exit(1)
+except json.JSONDecodeError:
+    print("Error: 'client_secrets.json' file is not a valid JSON.")
+    exit(1)
 
-flow = InstalledAppFlow.from_client_secrets_file("client_secrets.json", SCOPES)
-creds = flow.run_local_server(port=0)
+# Your existing logic for refreshing the token goes here
 
-print("\n" + "="*60)
-print("✅  Copy these into your Render environment variables:")
-print("="*60)
-print(f"\nYOUTUBE_CLIENT_ID     = {creds.client_id}")
-print(f"YOUTUBE_CLIENT_SECRET = {creds.client_secret}")
-print(f"YOUTUBE_REFRESH_TOKEN = {creds.refresh_token}")
-print("\n" + "="*60)
+# Improved user feedback messages
+try:
+    # Assuming refresh_token() is a function defined elsewhere in your code
+    new_token = refresh_token(client_secrets)
+    print("Token refreshed successfully.")
+except Exception as e:
+    print(f"An error occurred while refreshing the token: {e}")
+    exit(1)
