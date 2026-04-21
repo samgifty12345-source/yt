@@ -1,7 +1,7 @@
 """
-YouTube Auto Uploader — Web Dashboard Edition
-- Simple webpage to paste video links
-- Bot downloads from Google Drive and posts to YouTube
+YouTube Auto Uploader — Web Dashboard + Auto Post Edition
+- Posts links submitted via dashboard immediately
+- If nothing submitted for 4 hours, auto posts the default video
 - Posts as both regular video and Short
 - Uses Groq to generate title and description
 """
@@ -14,7 +14,7 @@ import threading
 import requests
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
 import gdown
 from google.oauth2.credentials import Credentials
@@ -22,13 +22,18 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-QUEUE_FILE   = "queue.txt"
 DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
+WAIT_SECONDS = 4 * 3600  # 4 hours
 
-# Shared queue for links submitted via web
+DEFAULT_VIDEO = {
+    "url": "https://drive.google.com/file/d/1VJhJFJp_gcvpSoriZ9ZzaGjsFRzNK4kl/view?usp=sharing",
+    "hint": "ronaldo skills goals edit"
+}
+
 pending_links = []
 lock = threading.Lock()
+last_post_time = [0]  # using list so it's mutable inside threads
 
 
 # ── Web Dashboard ─────────────────────────────────────────────────────────────
@@ -42,16 +47,14 @@ HTML = """<!DOCTYPE html>
     body {{ font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; padding: 30px; }}
     h1 {{ color: #ff0000; margin-bottom: 20px; }}
     .card {{ background: #1a1a1a; border-radius: 12px; padding: 24px; max-width: 600px; }}
-    input, textarea {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
+    input {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
       background: #2a2a2a; color: #fff; font-size: 15px; margin-bottom: 12px; }}
     button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px;
       border-radius: 8px; font-size: 16px; cursor: pointer; width: 100%; }}
     button:hover {{ background: #cc0000; }}
-    .status {{ margin-top: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;
-      font-size: 14px; color: #aaa; }}
+    .status {{ margin-top: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px; font-size: 14px; color: #aaa; }}
     .queue {{ margin-top: 16px; }}
-    .item {{ background: #222; padding: 10px; border-radius: 6px; margin-bottom: 8px;
-      font-size: 13px; color: #ccc; word-break: break-all; }}
+    .item {{ background: #222; padding: 10px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ccc; word-break: break-all; }}
     h3 {{ margin-bottom: 10px; color: #aaa; font-size: 14px; }}
   </style>
 </head>
@@ -65,8 +68,9 @@ HTML = """<!DOCTYPE html>
       <button type="submit">🚀 Add to Queue</button>
     </form>
     <div class="status">
-      📋 Videos in queue: <b>{queue_count}</b> &nbsp;|&nbsp;
-      ✅ Posted so far: <b>{done_count}</b>
+      📋 In queue: <b>{queue_count}</b> &nbsp;|&nbsp;
+      ✅ Posted: <b>{done_count}</b> &nbsp;|&nbsp;
+      ⏱ Next auto post in: <b>{next_post}</b>
     </div>
     <div class="queue">
       <h3>CURRENT QUEUE</h3>
@@ -85,8 +89,20 @@ class Handler(BaseHTTPRequestHandler):
         if os.path.exists(DONE_FILE):
             with open(DONE_FILE) as f:
                 done_count = len([l for l in f if l.strip()])
-        items = "".join(f'<div class="item">🔗 {x["url"]}<br><small>{x.get("hint","")}</small></div>' for x in q) or "<div class='item'>Empty — add a video above!</div>"
-        html = HTML.format(queue_count=len(q), done_count=done_count, queue_items=items)
+
+        # Calculate time until next auto post
+        elapsed = time.time() - last_post_time[0]
+        remaining = max(0, WAIT_SECONDS - elapsed)
+        hrs  = int(remaining // 3600)
+        mins = int((remaining % 3600) // 60)
+        next_post = f"{hrs}h {mins}m" if remaining > 0 else "soon"
+
+        items = "".join(
+            f'<div class="item">🔗 {x["url"]}<br><small>{x.get("hint","")}</small></div>'
+            for x in q
+        ) or "<div class='item'>Empty — add a video or wait for auto post!</div>"
+
+        html = HTML.format(queue_count=len(q), done_count=done_count, next_post=next_post, queue_items=items)
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
@@ -116,7 +132,7 @@ def start_server():
 
 
 # ── Groq metadata ─────────────────────────────────────────────────────────────
-def generate_metadata(hint: str) -> dict:
+def generate_metadata(hint):
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending"}
@@ -201,54 +217,62 @@ def mark_done(url):
         f.write(url + "\n")
 
 
+def process_video(youtube, item):
+    url  = item["url"]
+    hint = item.get("hint", "viral video")
+
+    print(f"\n📥  Processing: {url}")
+    print(f"  ⬇️  Downloading...")
+
+    file_path = download_from_drive(url)
+    if not file_path:
+        print("  ❌  Download failed. Skipping.")
+        return
+
+    size_mb = os.path.getsize(file_path) / (1024*1024)
+    print(f"  📦  {size_mb:.1f} MB")
+
+    meta        = generate_metadata(hint)
+    title       = meta["title"]
+    description = f"{meta['description']}\n\n{meta['hashtags']}"
+
+    print(f"  📹  Posting as Video...")
+    upload_video(youtube, file_path, title, description, is_short=False)
+    time.sleep(5)
+    print(f"  🎬  Posting as Short...")
+    upload_video(youtube, file_path, title, description, is_short=True)
+
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+
+    mark_done(url)
+    last_post_time[0] = time.time()
+    print(f"  ✅  Done!\n")
+
+
 # ── Bot loop ──────────────────────────────────────────────────────────────────
 def bot_loop():
     youtube = get_youtube_client()
-    print("🤖  Bot running. Paste links at your Render URL.\n")
+    last_post_time[0] = time.time()
+    print("🤖  Bot running. Dashboard + auto post every 4 hours.\n")
 
     while True:
         with lock:
             item = pending_links.pop(0) if pending_links else None
 
-        if not item:
-            time.sleep(10)  # check every 10 seconds for new links
-            continue
-
-        url  = item["url"]
-        hint = item.get("hint", "viral video")
-
-        print(f"\n📥  Processing: {url}")
-        print(f"  ⬇️  Downloading...")
-
-        file_path = download_from_drive(url)
-        if not file_path:
-            print("  ❌  Download failed. Skipping.")
-            continue
-
-        size_mb = os.path.getsize(file_path) / (1024*1024)
-        print(f"  📦  {size_mb:.1f} MB")
-
-        meta        = generate_metadata(hint)
-        title       = meta["title"]
-        description = f"{meta['description']}\n\n{meta['hashtags']}"
-
-        # Post as regular video
-        print(f"  📹  Posting as Video...")
-        upload_video(youtube, file_path, title, description, is_short=False)
-
-        time.sleep(5)
-
-        # Post as Short
-        print(f"  🎬  Posting as Short...")
-        upload_video(youtube, file_path, title, description, is_short=True)
-
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-
-        mark_done(url)
-        print(f"  ✅  Done! Waiting for next link...\n")
+        if item:
+            # Someone submitted via dashboard — post it now
+            process_video(youtube, item)
+        else:
+            # Check if 4 hours have passed since last post
+            elapsed = time.time() - last_post_time[0]
+            if elapsed >= WAIT_SECONDS:
+                print("⏰  4 hours passed, auto posting default video...")
+                process_video(youtube, DEFAULT_VIDEO)
+            else:
+                time.sleep(10)
 
 
 def main():
