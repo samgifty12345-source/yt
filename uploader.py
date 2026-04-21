@@ -1,5 +1,9 @@
 """
-YouTube Auto Uploader — Runs forever with dummy web server
+YouTube Auto Uploader — Web Dashboard Edition
+- Simple webpage to paste video links
+- Bot downloads from Google Drive and posts to YouTube
+- Posts as both regular video and Short
+- Uses Groq to generate title and description
 """
 
 import os
@@ -7,7 +11,10 @@ import csv
 import time
 import tempfile
 import threading
+import requests
+import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
 
 import gdown
 from google.oauth2.credentials import Credentials
@@ -15,26 +22,131 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-CSV_FILE     = "videos.csv"
+QUEUE_FILE   = "queue.txt"
+DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
-WAIT_SECONDS = 3600
+
+# Shared queue for links submitted via web
+pending_links = []
+lock = threading.Lock()
 
 
-# Dummy server to keep Render happy
+# ── Web Dashboard ─────────────────────────────────────────────────────────────
+HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <title>YouTube Auto Uploader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{ font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; padding: 30px; }}
+    h1 {{ color: #ff0000; margin-bottom: 20px; }}
+    .card {{ background: #1a1a1a; border-radius: 12px; padding: 24px; max-width: 600px; }}
+    input, textarea {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
+      background: #2a2a2a; color: #fff; font-size: 15px; margin-bottom: 12px; }}
+    button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px;
+      border-radius: 8px; font-size: 16px; cursor: pointer; width: 100%; }}
+    button:hover {{ background: #cc0000; }}
+    .status {{ margin-top: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px;
+      font-size: 14px; color: #aaa; }}
+    .queue {{ margin-top: 16px; }}
+    .item {{ background: #222; padding: 10px; border-radius: 6px; margin-bottom: 8px;
+      font-size: 13px; color: #ccc; word-break: break-all; }}
+    h3 {{ margin-bottom: 10px; color: #aaa; font-size: 14px; }}
+  </style>
+</head>
+<body>
+  <h1>🎬 YouTube Auto Uploader</h1>
+  <div class="card">
+    <h3>PASTE GOOGLE DRIVE LINK</h3>
+    <form method="POST" action="/add">
+      <input name="url" placeholder="https://drive.google.com/file/d/.../view" required />
+      <input name="hint" placeholder="Short description e.g. ronaldo free kick goals" />
+      <button type="submit">🚀 Add to Queue</button>
+    </form>
+    <div class="status">
+      📋 Videos in queue: <b>{queue_count}</b> &nbsp;|&nbsp;
+      ✅ Posted so far: <b>{done_count}</b>
+    </div>
+    <div class="queue">
+      <h3>CURRENT QUEUE</h3>
+      {queue_items}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        with lock:
+            q = list(pending_links)
+        done_count = 0
+        if os.path.exists(DONE_FILE):
+            with open(DONE_FILE) as f:
+                done_count = len([l for l in f if l.strip()])
+        items = "".join(f'<div class="item">🔗 {x["url"]}<br><small>{x.get("hint","")}</small></div>' for x in q) or "<div class='item'>Empty — add a video above!</div>"
+        html = HTML.format(queue_count=len(q), done_count=done_count, queue_items=items)
         self.send_response(200)
+        self.send_header("Content-Type", "text/html")
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(html.encode())
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body   = self.rfile.read(length).decode()
+        params = parse_qs(body)
+        url    = params.get("url", [""])[0].strip()
+        hint   = params.get("hint", [""])[0].strip()
+        if url:
+            with lock:
+                pending_links.append({"url": url, "hint": hint})
+            print(f"  ➕  Added to queue: {url}")
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
     def log_message(self, *args):
-        pass  # silence logs
+        pass
+
 
 def start_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
+# ── Groq metadata ─────────────────────────────────────────────────────────────
+def generate_metadata(hint: str) -> dict:
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending"}
+
+    prompt = f"""Generate YouTube metadata for a video about: "{hint}"
+Return ONLY valid JSON, no extra text:
+{{
+  "title": "catchy title under 70 chars, no hashtags",
+  "description": "engaging 2-3 sentence description",
+  "hashtags": "#tag1 #tag2 #tag3 #tag4 #tag5 #tag6"
+}}"""
+
+    try:
+        res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}], "temperature": 0.9},
+            timeout=15
+        )
+        text = res.json()["choices"][0]["message"]["content"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        print(f"  🤖  Title: {data['title']}")
+        return data
+    except Exception as e:
+        print(f"  ⚠️  Groq failed: {e}")
+        return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending #edit"}
+
+
+# ── YouTube ───────────────────────────────────────────────────────────────────
 def get_youtube_client():
     creds = Credentials(
         token=None,
@@ -49,14 +161,6 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def load_videos():
-    if not os.path.exists(CSV_FILE):
-        return []
-    with open(CSV_FILE, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-    return [r for r in rows if r.get("drive_url", "").strip()]
-
-
 def download_from_drive(url):
     out = os.path.join(DOWNLOAD_DIR, "video.mp4")
     if os.path.exists(out):
@@ -69,10 +173,11 @@ def download_from_drive(url):
         return None
 
 
-def upload_video(youtube, file_path, title, description, category_id, privacy):
+def upload_video(youtube, file_path, title, description, is_short=False):
+    final_title = f"{title} #Shorts" if is_short else title
     body = {
-        "snippet": {"title": title, "description": description, "categoryId": category_id},
-        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
+        "snippet": {"title": final_title[:100], "description": description, "categoryId": "24"},
+        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
     }
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
     try:
@@ -83,63 +188,71 @@ def upload_video(youtube, file_path, title, description, category_id, privacy):
             if status:
                 print(f"    ⬆️  {int(status.progress()*100)}%", end="\r")
         vid = response.get("id")
-        print(f"    ✅  https://youtube.com/watch?v={vid}    ")
+        kind = "Short" if is_short else "Video"
+        print(f"    ✅  {kind} → https://youtube.com/watch?v={vid}    ")
         return vid
     except Exception as e:
         print(f"  ❌  Upload failed: {e}")
         return None
 
 
+def mark_done(url):
+    with open(DONE_FILE, "a") as f:
+        f.write(url + "\n")
+
+
+# ── Bot loop ──────────────────────────────────────────────────────────────────
 def bot_loop():
     youtube = get_youtube_client()
-    print("🤖  Bot is running. Posts 1 video per hour forever.\n")
+    print("🤖  Bot running. Paste links at your Render URL.\n")
 
     while True:
-        videos = load_videos()
+        with lock:
+            item = pending_links.pop(0) if pending_links else None
 
-        if not videos:
-            print("😴  No videos in CSV. Checking again in 1 hour...")
-            time.sleep(WAIT_SECONDS)
+        if not item:
+            time.sleep(10)  # check every 10 seconds for new links
             continue
 
-        print(f"📋  {len(videos)} video(s) in CSV\n")
+        url  = item["url"]
+        hint = item.get("hint", "viral video")
 
-        for i, row in enumerate(videos, 1):
-            url         = row["drive_url"].strip()
-            title       = row.get("title", "Untitled").strip()
-            description = row.get("notes", "").strip()
-            category    = row.get("category_id", "24").strip()
-            privacy     = row.get("privacy", "public").strip().lower()
+        print(f"\n📥  Processing: {url}")
+        print(f"  ⬇️  Downloading...")
 
-            print(f"[{i}/{len(videos)}] {title}")
-            print(f"  ⬇️  Downloading...")
+        file_path = download_from_drive(url)
+        if not file_path:
+            print("  ❌  Download failed. Skipping.")
+            continue
 
-            file_path = download_from_drive(url)
-            if not file_path:
-                print("  ❌  Skipping.\n")
-                time.sleep(WAIT_SECONDS)
-                continue
+        size_mb = os.path.getsize(file_path) / (1024*1024)
+        print(f"  📦  {size_mb:.1f} MB")
 
-            size_mb = os.path.getsize(file_path) / (1024*1024)
-            print(f"  📦  {size_mb:.1f} MB")
+        meta        = generate_metadata(hint)
+        title       = meta["title"]
+        description = f"{meta['description']}\n\n{meta['hashtags']}"
 
-            upload_video(youtube, file_path, title, description, category, privacy)
+        # Post as regular video
+        print(f"  📹  Posting as Video...")
+        upload_video(youtube, file_path, title, description, is_short=False)
 
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
+        time.sleep(5)
 
-            print(f"\n⏳  Waiting 1 hour before next video...\n")
-            time.sleep(WAIT_SECONDS)
+        # Post as Short
+        print(f"  🎬  Posting as Short...")
+        upload_video(youtube, file_path, title, description, is_short=True)
+
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+        mark_done(url)
+        print(f"  ✅  Done! Waiting for next link...\n")
 
 
 def main():
-    # Start dummy web server in background thread
-    t = threading.Thread(target=start_server, daemon=True)
-    t.start()
-
-    # Run bot in main thread
+    threading.Thread(target=start_server, daemon=True).start()
     bot_loop()
 
 
