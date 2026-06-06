@@ -1,7 +1,9 @@
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
+google-auth
 google-genai
 gdown
 requests
 pillow
+yt-dlp
