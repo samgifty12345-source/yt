@@ -1,7 +1,7 @@
 """
 AI Video Pipeline — Full Automated Edition
 1. Groq generates a story + 6 scene descriptions
-2. Gemini Imagen generates 1 image per scene
+2. Pollinations AI generates 1 image per scene (free, no key needed)
 3. ffmpeg applies Ken Burns zoom/pan effect to each image
 4. ElevenLabs generates voiceover
 5. ffmpeg combines all clips + audio
@@ -22,14 +22,12 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google import genai
 
 WORK_DIR      = tempfile.gettempdir()
 DONE_FILE     = "done_pipeline.txt"
 WAIT_SECONDS  = 24 * 3600
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
-GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
@@ -186,18 +184,23 @@ Return ONLY valid JSON, no extra text, no markdown:
 def generate_image(prompt, index):
     log(f"  🎨 Generating image {index+1}/6...")
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        result = client.models.generate_images(
-            model="imagen-3.0-generate-002",
-            prompt=f"{prompt}, cinematic, high quality, detailed, 16:9 aspect ratio",
-            config={"number_of_images": 1, "aspect_ratio": "16:9"},
+        encoded_prompt = requests.utils.quote(
+            f"{prompt}, cinematic, high quality, detailed, photorealistic"
         )
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+            f"?width=1280&height=720&nologo=true&seed={index}"
+        )
+        res = requests.get(url, timeout=60)
+        res.raise_for_status()
         img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-        result.generated_images[0].image.save(img_path)
+        with open(img_path, "wb") as f:
+            f.write(res.content)
         log(f"  ✅ Image {index+1} saved")
         return img_path
     except Exception as e:
         log(f"  ❌ Image {index+1} failed: {e}")
+        # Fallback: plain colored placeholder
         try:
             from PIL import Image, ImageDraw
             img = Image.new("RGB", (1280, 720), color=(20, 20, 40))
