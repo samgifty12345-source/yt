@@ -1,5 +1,2 @@
-[providers]
-python = {}
-
 [phases.setup]
 pkgs = ["python3", "nodejs", "ffmpeg"]
