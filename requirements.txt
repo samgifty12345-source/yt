@@ -4,3 +4,6 @@ google-auth-oauthlib
 google-auth-httplib2
 gdown
 requests
+google-generativeai
+elevenlabs
+pillow
