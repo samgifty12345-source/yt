@@ -187,10 +187,7 @@ def generate_image(prompt, index):
         encoded_prompt = requests.utils.quote(
             f"{prompt}, cinematic, high quality, detailed, photorealistic"
         )
-        url = (
-            f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            f"?width=1280&height=720&nologo=true&seed={index}"
-        )
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&seed={index}"
         res = requests.get(url, timeout=60)
         res.raise_for_status()
         img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
@@ -200,7 +197,6 @@ def generate_image(prompt, index):
         return img_path
     except Exception as e:
         log(f"  ❌ Image {index+1} failed: {e}")
-        # Fallback: plain colored placeholder
         try:
             from PIL import Image, ImageDraw
             img = Image.new("RGB", (1280, 720), color=(20, 20, 40))
