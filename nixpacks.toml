@@ -1,2 +1,0 @@
-[phases.setup]
-pkgs = ["python", "nodejs", "ffmpeg"]
