@@ -24,7 +24,7 @@ from googleapiclient.http import MediaFileUpload
 
 DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
-WAIT_SECONDS = 4 * 3600  # 4 hours
+WAIT_SECONDS = 0  # 4 hours
 
 DEFAULT_VIDEO = {
     "url": "https://drive.google.com/file/d/1VJhJFJp_gcvpSoriZ9ZzaGjsFRzNK4kl/view?usp=sharing",
