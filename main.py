@@ -17,11 +17,10 @@ from googleapiclient.http import MediaFileUpload
 WORK_DIR     = tempfile.gettempdir()
 DONE_FILE    = "done_pipeline.txt"
 
-GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
-# Write YouTube cookies file from env var or embedded fallback
 COOKIES_PATH = os.path.join(WORK_DIR, "yt_cookies.txt")
 YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie File
 .youtube.com	TRUE	/	TRUE	1815339941	PREF	f4=4000000&f6=40000000&tz=Atlantic.Reykjavik&f7=100
@@ -127,29 +126,74 @@ def download_video_and_captions(url):
     log("📥 Downloading video + captions...")
     video_path = os.path.join(WORK_DIR, "source_video.mp4")
 
-    # Update yt-dlp silently to ensure n-challenge support is current
+    # Always update yt-dlp first — n-challenge fixes ship constantly
     try:
-        subprocess.run(["yt-dlp", "-U"], capture_output=True, timeout=30)
-    except Exception:
-        pass
+        r = subprocess.run(["yt-dlp", "-U"], capture_output=True, timeout=60, text=True)
+        log(f"  yt-dlp: {r.stdout.strip()[-80:] or 'up to date'}")
+    except Exception as e:
+        log(f"  ⚠️ yt-dlp update skipped: {e}")
 
-    # Base yt-dlp flags shared by all attempts
-    base_flags = [
-        "--cookies", COOKIES_PATH,
-        "--no-cache-dir",
-        "--no-check-certificates",
-        # tv_embedded bypasses the n-challenge JS requirement entirely
-        "--extractor-args", "youtube:player_client=tv_embedded,android",
-        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
+    # FORMAT selector with broad fallback chain
+    fmt = (
+        "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
+        "/bestvideo[ext=mp4]+bestaudio"
+        "/best[ext=mp4]"
+        "/best"
+    )
+
+    # Each attempt is (label, extra_flags)
+    # Strategy:
+    #   1. ios client — no n-challenge, no cookie conflict, no proxy
+    #   2. web client + cookies — standard logged-in, no proxy
+    #   3. ios client + proxy — geo unblock
+    #   4. web client + cookies + proxy
+    PROXY = "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863"
+
+    attempts = [
+        (
+            "ios (no proxy)",
+            [
+                "--extractor-args", "youtube:player_client=ios",
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
+        (
+            "web+cookies (no proxy)",
+            [
+                "--cookies", COOKIES_PATH,
+                "--extractor-args", "youtube:player_client=web",
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
+        (
+            "ios + proxy",
+            [
+                "--extractor-args", "youtube:player_client=ios",
+                "--proxy", PROXY,
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
+        (
+            "web+cookies + proxy",
+            [
+                "--cookies", COOKIES_PATH,
+                "--extractor-args", "youtube:player_client=web",
+                "--proxy", PROXY,
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
     ]
 
-    # Download captions first (no proxy needed)
+    # Caption download — try ios first (no cookie conflict)
     cap_cmd = [
         "yt-dlp",
-        "--cookies", COOKIES_PATH,
+        "--extractor-args", "youtube:player_client=ios",
         "--no-check-certificates",
-        "--extractor-args", "youtube:player_client=tv_embedded,android",
+        "--no-cache-dir",
         "--write-auto-sub", "--sub-lang", "en",
         "--sub-format", "json3",
         "--skip-download",
@@ -158,41 +202,53 @@ def download_video_and_captions(url):
     ]
     try:
         result = subprocess.run(cap_cmd, capture_output=True, timeout=60, text=True)
-        if result.returncode != 0:
-            log(f"  ⚠️ Caption issue: {result.stderr[-200:]}")
-        else:
+        if result.returncode == 0:
             log("  ✅ Captions downloaded")
+        else:
+            # fallback: try with cookies
+            cap_cmd2 = [
+                "yt-dlp",
+                "--cookies", COOKIES_PATH,
+                "--extractor-args", "youtube:player_client=web",
+                "--no-check-certificates",
+                "--no-cache-dir",
+                "--write-auto-sub", "--sub-lang", "en",
+                "--sub-format", "json3",
+                "--skip-download",
+                "-o", os.path.join(WORK_DIR, "captions"),
+                url
+            ]
+            result2 = subprocess.run(cap_cmd2, capture_output=True, timeout=60, text=True)
+            if result2.returncode == 0:
+                log("  ✅ Captions downloaded (web client)")
+            else:
+                log(f"  ⚠️ Captions unavailable — will use first 60s fallback")
     except Exception as e:
-        log(f"  ⚠️ Caption download issue: {e}")
+        log(f"  ⚠️ Caption download error: {e}")
 
-    # Attempt 1: with proxy
-    log("  🔄 Trying download with proxy...")
-    vid_cmd = ["yt-dlp"] + base_flags + [
-        "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
-        "-o", video_path,
-        url
-    ]
-    try:
-        result = subprocess.run(vid_cmd, capture_output=True, timeout=300, text=True)
-        if result.returncode == 0:
-            log("  ✅ Video downloaded (via proxy)")
-            return video_path
-        log(f"  ⚠️ Proxy attempt failed: {result.stderr[-200:]}")
-    except Exception as e:
-        log(f"  ⚠️ Proxy attempt error: {e}")
+    # Video download — try each strategy in order
+    for label, extra_flags in attempts:
+        log(f"  🔄 Trying: {label}...")
+        cmd = ["yt-dlp"] + extra_flags + [
+            "-f", fmt,
+            "--merge-output-format", "mp4",
+            "-o", video_path,
+            url
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=300, text=True)
+            if result.returncode == 0 and os.path.exists(video_path):
+                log(f"  ✅ Video downloaded ({label})")
+                return video_path
+            # Show last 200 chars of stderr for diagnosis
+            err = result.stderr[-200:].replace("\n", " ")
+            log(f"  ⚠️ Failed ({label}): ...{err}")
+        except subprocess.TimeoutExpired:
+            log(f"  ⚠️ Timeout ({label})")
+        except Exception as e:
+            log(f"  ⚠️ Error ({label}): {e}")
 
-    # Attempt 2: without proxy (direct)
-    log("  🔄 Trying download without proxy...")
-    vid_cmd = ["yt-dlp"] + base_flags + ["-o", video_path, url]
-    try:
-        result = subprocess.run(vid_cmd, capture_output=True, timeout=300, text=True)
-        if result.returncode == 0:
-            log("  ✅ Video downloaded (direct)")
-            return video_path
-        log(f"  ❌ Direct attempt failed: {result.stderr[-300:]}")
-    except Exception as e:
-        log(f"  ❌ Direct attempt error: {e}")
-
+    log("  ❌ All download attempts failed")
     return None
 
 
@@ -201,14 +257,13 @@ def parse_captions():
     files = glob.glob(os.path.join(WORK_DIR, "captions*.json3")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.vtt")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.json"))
-    
+
     if not files:
         log("  ⚠️ No caption file found")
         return []
 
     cap_file = files[0]
     log(f"  📄 Parsing: {os.path.basename(cap_file)}")
-
     segments = []
 
     if cap_file.endswith(".json3"):
@@ -253,9 +308,8 @@ def find_best_clip(segments):
         log("  ⚠️ No captions — using first 60 seconds")
         return 0, 60, {"hook": "You won't believe this...", "title": "Incredible Moment", "description": "Watch this amazing clip."}
 
-    # Build transcript with timestamps
     transcript_lines = []
-    for s in segments[:300]:  # First 300 segments max
+    for s in segments[:300]:
         transcript_lines.append(f"[{s['start']:.1f}s] {s['text']}")
     transcript = "\n".join(transcript_lines)
 
@@ -268,12 +322,12 @@ Return ONLY valid JSON:
 {{
   "start_seconds": <number - start time in seconds>,
   "end_seconds": <number - exactly 60 seconds after start>,
-  "hook": "one punchy sentence teasing what happens (e.g. 'You won't believe what happened next...')",
+  "hook": "one punchy sentence teasing what happens",
   "title": "short viral YouTube title under 60 chars",
   "description": "2-3 sentence description"
 }}
 
-Pick the moment with the most drama, surprise, or emotion. start_seconds and end_seconds must be exactly 60 seconds apart."""
+start_seconds and end_seconds must be exactly 60 seconds apart."""
 
     try:
         res = requests.post(
@@ -321,11 +375,7 @@ def clip_video(video_path, start, end):
 
 def generate_commentary(hook, segments, start, end):
     log("📝 Generating commentary script...")
-    
-    # Get the transcript for this window
-    window_text = " ".join(
-        s["text"] for s in segments if start <= s["start"] <= end
-    )
+    window_text = " ".join(s["text"] for s in segments if start <= s["start"] <= end)
 
     prompt = f"""Write a short, punchy 15-second spoken commentary for a YouTube Short.
 
@@ -458,8 +508,8 @@ def run_pipeline(url):
     # 3. Find best clip
     start, end, clip_data = find_best_clip(segments)
     if isinstance(clip_data, dict):
-        hook = clip_data.get("hook", "You won't believe this...")
-        title = clip_data.get("title", "Incredible Moment")
+        hook        = clip_data.get("hook", "You won't believe this...")
+        title       = clip_data.get("title", "Incredible Moment")
         description = clip_data.get("description", "Watch this amazing clip.")
     else:
         hook, title, description = str(clip_data), "Incredible Moment", "Watch this."
