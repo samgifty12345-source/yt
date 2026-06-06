@@ -1,15 +1,3 @@
-"""
-AI Video Pipeline — Viral Clip Edition
-1. You paste a YouTube link
-2. yt-dlp downloads the video + auto-captions
-3. Groq reads captions and picks the best 60-second moment
-4. ffmpeg clips that section
-5. Groq writes a commentary hook ("You won't believe what happened...")
-6. ElevenLabs voices the commentary
-7. ffmpeg mixes commentary over original audio (ducked)
-8. Uploads to YouTube as a Short
-"""
-
 import os
 import time
 import json
@@ -18,6 +6,7 @@ import requests
 import subprocess
 import threading
 import re
+import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from google.oauth2.credentials import Credentials
@@ -137,7 +126,6 @@ def start_server():
 def download_video_and_captions(url):
     log("📥 Downloading video + captions...")
     video_path = os.path.join(WORK_DIR, "source_video.mp4")
-    captions_path = os.path.join(WORK_DIR, "captions.json")
 
     # Download captions first
     cap_cmd = [
@@ -158,13 +146,16 @@ def download_video_and_captions(url):
     except Exception as e:
         log(f"  ⚠️ Caption download issue: {e}")
 
-    # Modified Video Download Command — Adaptive formats with dynamic ffmpeg merging
+    # Protected Video Download Command with Active Cache-Busting and Spoofing
     vid_cmd = [
         "yt-dlp",
         "--cookies", COOKIES_PATH,
         "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
+        "--no-cache-dir",
+        "--rm-cached-signatures",
+        "--extractor-args", "youtube:player_client=android,web;skip=dash,hls",
         "-o", video_path,
         url
     ]
@@ -182,7 +173,6 @@ def download_video_and_captions(url):
 
 def parse_captions():
     """Find and parse the downloaded caption file, return list of {start, end, text}"""
-    import glob
     files = glob.glob(os.path.join(WORK_DIR, "captions*.json3")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.vtt")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.json"))
@@ -236,7 +226,7 @@ def find_best_clip(segments):
 
     if not segments:
         log("  ⚠️ No captions — using first 60 seconds")
-        return 0, 60, "Incredible moment from this video"
+        return 0, 60, {"hook": "You won't believe this...", "title": "Incredible Moment", "description": "Watch this amazing clip."}
 
     # Build transcript with timestamps
     transcript_lines = []
@@ -244,6 +234,7 @@ def find_best_clip(segments):
         transcript_lines.append(f"[{s['start']:.1f}s] {s['text']}")
     transcript = "\n".join(transcript_lines)
 
+    # Double curly braces implementation to avoid string layout crashes with HTML formatters
     prompt = f"""You are a YouTube Shorts editor. Find the single most engaging, surprising, or emotional 60-second moment in this transcript.
 
 TRANSCRIPT:
@@ -371,10 +362,8 @@ def generate_voiceover(script):
 def mix_audio(clip_path, voiceover_path, output_path):
     log("🎚️ Mixing audio...")
     if not voiceover_path:
-        # No voiceover — just copy clip
         cmd = ["ffmpeg", "-y", "-i", clip_path, "-c", "copy", output_path]
     else:
-        # Duck original audio to 20%, commentary at 100%
         cmd = [
             "ffmpeg", "-y",
             "-i", clip_path,
@@ -391,7 +380,7 @@ def mix_audio(clip_path, voiceover_path, output_path):
         return output_path
     except Exception as e:
         log(f"  ❌ Mix failed: {e}")
-        return clip_path  # fallback to unmixed clip
+        return clip_path
 
 
 def upload_to_youtube(file_path, title, description):
@@ -465,7 +454,7 @@ def run_pipeline(url):
 
     # 7. Mix
     final_path = os.path.join(WORK_DIR, "final_short.mp4")
-    result = mix_audio(clip_path, voiceover_path, final_path)
+    mix_audio(clip_path, voiceover_path, final_path)
 
     # 8. Upload
     vid = upload_to_youtube(final_path, title, description)
@@ -476,7 +465,7 @@ def run_pipeline(url):
     else:
         log("❌ Upload failed")
 
-    # Cleanup
+    # Cleanup temporary local storage cache layers
     for path in [video_path, clip_path, voiceover_path, final_path]:
         try:
             if path and os.path.exists(path):
