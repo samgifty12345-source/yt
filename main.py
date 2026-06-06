@@ -146,16 +146,18 @@ def download_video_and_captions(url):
     except Exception as e:
         log(f"  ⚠️ Caption download issue: {e}")
 
-    # Protected Video Download Command with Active Cache-Busting and Spoofing
+    # FIX: Removed invalid --rm-cached-signatures flag.
+    # FIX: Removed skip=dash,hls from extractor-args — it was blocking available formats.
+    # FIX: Added broader format fallback chain so more videos are compatible.
     vid_cmd = [
         "yt-dlp",
         "--cookies", COOKIES_PATH,
         "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "--no-cache-dir",
-        "--rm-cached-signatures",
-        "--extractor-args", "youtube:player_client=android,web;skip=dash,hls",
+        "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=android,web",
         "-o", video_path,
         url
     ]
@@ -234,7 +236,6 @@ def find_best_clip(segments):
         transcript_lines.append(f"[{s['start']:.1f}s] {s['text']}")
     transcript = "\n".join(transcript_lines)
 
-    # Double curly braces implementation to avoid string layout crashes with HTML formatters
     prompt = f"""You are a YouTube Shorts editor. Find the single most engaging, surprising, or emotional 60-second moment in this transcript.
 
 TRANSCRIPT:
@@ -465,7 +466,7 @@ def run_pipeline(url):
     else:
         log("❌ Upload failed")
 
-    # Cleanup temporary local storage cache layers
+    # Cleanup
     for path in [video_path, clip_path, voiceover_path, final_path]:
         try:
             if path and os.path.exists(path):
