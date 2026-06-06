@@ -21,7 +21,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import google.generativeai as genai
+from google import genai
 
 WORK_DIR     = tempfile.gettempdir()
 DONE_FILE    = "done_pipeline.txt"
