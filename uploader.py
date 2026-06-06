@@ -1,7 +1,7 @@
 """
 AI Video Pipeline — Full Automated Edition
 1. Groq generates a story + 6 scene descriptions
-2. Picsum provides placeholder images (free, no key needed)
+2. Hugging Face FLUX.1 generates 1 image per scene (free)
 3. ffmpeg applies Ken Burns zoom/pan effect to each image
 4. ElevenLabs generates voiceover
 5. ffmpeg combines all clips + audio
@@ -28,6 +28,7 @@ DONE_FILE     = "done_pipeline.txt"
 WAIT_SECONDS  = 24 * 3600
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+HF_API_KEY          = "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"
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
@@ -184,9 +185,10 @@ Return ONLY valid JSON, no extra text, no markdown:
 def generate_image(prompt, index):
     log(f"  🎨 Generating image {index+1}/6...")
     try:
-        # Picsum — free random photos, no API key needed
-        url = f"https://picsum.photos/seed/{index}/1280/720"
-        res = requests.get(url, timeout=30)
+        API_URL = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+        payload = {"inputs": f"{prompt}, cinematic, high quality, detailed, photorealistic"}
+        res = requests.post(API_URL, headers=headers, json=payload, timeout=120)
         res.raise_for_status()
         img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
         with open(img_path, "wb") as f:
@@ -196,12 +198,12 @@ def generate_image(prompt, index):
     except Exception as e:
         log(f"  ❌ Image {index+1} failed: {e}")
         try:
-            from PIL import Image, ImageDraw
-            img = Image.new("RGB", (1280, 720), color=(20, 20, 40))
-            draw = ImageDraw.Draw(img)
-            draw.text((640, 360), f"Scene {index+1}", fill=(200, 200, 200), anchor="mm")
+            r = requests.get(f"https://picsum.photos/seed/{index+42}/1280/720", timeout=30)
+            r.raise_for_status()
             img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-            img.save(img_path)
+            with open(img_path, "wb") as f:
+                f.write(r.content)
+            log(f"  ⚠️ Used placeholder for image {index+1}")
             return img_path
         except:
             return None
@@ -234,6 +236,9 @@ def image_to_video(img_path, output_path, duration=10, index=0):
 
 def generate_voiceover(narration):
     log("🎙️ Generating voiceover...")
+    if not ELEVENLABS_API_KEY:
+        log("  ⚠️ No ElevenLabs key — skipping voiceover")
+        return None
     try:
         res = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
@@ -337,15 +342,6 @@ def upload_to_youtube(file_path, title, description, hashtags):
                 log(f"  ⬆️ {int(status.progress()*100)}%")
         vid = response.get("id")
         log(f"  ✅ Uploaded → https://youtube.com/watch?v={vid}")
-
-        body["snippet"]["title"] = f"{title[:94]} #Shorts"
-        media2 = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
-        req2 = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media2)
-        response2 = None
-        while response2 is None:
-            _, response2 = req2.next_chunk()
-        vid2 = response2.get("id")
-        log(f"  ✅ Short → https://youtube.com/watch?v={vid2}")
         return vid
     except Exception as e:
         log(f"  ❌ Upload failed: {e}")
@@ -364,7 +360,7 @@ def run_pipeline():
     for i, scene in enumerate(story["scenes"]):
         img = generate_image(scene["image_prompt"], i)
         images.append(img)
-        time.sleep(1)
+        time.sleep(2)
 
     clips = []
     for i, img_path in enumerate(images):
@@ -404,8 +400,7 @@ def run_pipeline():
 
 
 def bot_loop():
-    log("🤖 Bot started. Runs once per day.")
-    run_pipeline()
+    log("🤖 Bot started. Click Generate & Post Now to run.")
     while True:
         if last_post_time[0] is not None:
             elapsed = time.time() - last_post_time[0]
