@@ -1,13 +1,8 @@
 """
 YouTube Auto Uploader — Web Dashboard + Auto Post Edition
-- Posts links submitted via dashboard immediately
-- If nothing submitted for 4 hours, auto posts the default video
-- Posts as both regular video and Short
-- Uses Groq to generate title and description
 """
 
 import os
-import csv
 import time
 import tempfile
 import threading
@@ -24,7 +19,7 @@ from googleapiclient.http import MediaFileUpload
 
 DONE_FILE    = "done.txt"
 DOWNLOAD_DIR = tempfile.gettempdir()
-WAIT_SECONDS = 0  # 4 hours
+WAIT_SECONDS = 4 * 3600
 
 DEFAULT_VIDEO = {
     "url": "https://drive.google.com/file/d/1VJhJFJp_gcvpSoriZ9ZzaGjsFRzNK4kl/view?usp=sharing",
@@ -33,10 +28,9 @@ DEFAULT_VIDEO = {
 
 pending_links = []
 lock = threading.Lock()
-last_post_time = [0]  # using list so it's mutable inside threads
+last_post_time = [None]
 
 
-# ── Web Dashboard ─────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
 <html>
 <head>
@@ -90,12 +84,14 @@ class Handler(BaseHTTPRequestHandler):
             with open(DONE_FILE) as f:
                 done_count = len([l for l in f if l.strip()])
 
-        # Calculate time until next auto post
-        elapsed = time.time() - last_post_time[0]
-        remaining = max(0, WAIT_SECONDS - elapsed)
-        hrs  = int(remaining // 3600)
-        mins = int((remaining % 3600) // 60)
-        next_post = f"{hrs}h {mins}m" if remaining > 0 else "soon"
+        if last_post_time[0] is None:
+            next_post = "soon (first post)"
+        else:
+            elapsed = time.time() - last_post_time[0]
+            remaining = max(0, WAIT_SECONDS - elapsed)
+            hrs  = int(remaining // 3600)
+            mins = int((remaining % 3600) // 60)
+            next_post = f"{hrs}h {mins}m" if remaining > 0 else "soon"
 
         items = "".join(
             f'<div class="item">🔗 {x["url"]}<br><small>{x.get("hint","")}</small></div>'
@@ -131,7 +127,6 @@ def start_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-# ── Groq metadata ─────────────────────────────────────────────────────────────
 def generate_metadata(hint):
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
@@ -162,7 +157,6 @@ Return ONLY valid JSON, no extra text:
         return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending #edit"}
 
 
-# ── YouTube ───────────────────────────────────────────────────────────────────
 def get_youtube_client():
     creds = Credentials(
         token=None,
@@ -182,7 +176,7 @@ def download_from_drive(url):
     if os.path.exists(out):
         os.remove(out)
     try:
-        result = gdown.download(url, out, quiet=False, fuzzy=True)
+        result = gdown.download(url, out, quiet=False)
         return result if result and os.path.exists(result) else None
     except Exception as e:
         print(f"  ❌  Download failed: {e}")
@@ -227,7 +221,7 @@ def process_video(youtube, item):
     file_path = download_from_drive(url)
     if not file_path:
         print("  ❌  Download failed. Skipping.")
-        return
+        return False
 
     size_mb = os.path.getsize(file_path) / (1024*1024)
     print(f"  📦  {size_mb:.1f} MB")
@@ -250,23 +244,32 @@ def process_video(youtube, item):
     mark_done(url)
     last_post_time[0] = time.time()
     print(f"  ✅  Done!\n")
+    return True
 
 
-# ── Bot loop ──────────────────────────────────────────────────────────────────
 def bot_loop():
-    youtube = get_youtube_client()
-    last_post_time[0] = time.time()
-    print("🤖  Bot running. Dashboard + auto post every 4 hours.\n")
+    print("🔄 Authenticating...")
+    while True:
+        try:
+            youtube = get_youtube_client()
+            break
+        except Exception as e:
+            print(f"❌ Auth failed: {e}. Retrying in 30s...")
+            time.sleep(30)
+
+    # Post default video immediately on first run
+    print("⏰ First run — posting default video now...")
+    process_video(youtube, DEFAULT_VIDEO)
+
+    print("🤖 Bot running. Will auto post every 4 hours.\n")
 
     while True:
         with lock:
             item = pending_links.pop(0) if pending_links else None
 
         if item:
-            # Someone submitted via dashboard — post it now
             process_video(youtube, item)
         else:
-            # Check if 4 hours have passed since last post
             elapsed = time.time() - last_post_time[0]
             if elapsed >= WAIT_SECONDS:
                 print("⏰  4 hours passed, auto posting default video...")
