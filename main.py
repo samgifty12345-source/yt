@@ -162,6 +162,7 @@ def download_video_and_captions(url):
     vid_cmd = [
         "yt-dlp",
         "--cookies", COOKIES_PATH,
+        "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
         "-f", "best[ext=mp4]/best",
         "-o", video_path,
         url
