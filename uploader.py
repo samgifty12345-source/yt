@@ -1,119 +1,109 @@
 """
-YouTube Auto Uploader — Web Dashboard + Auto Post Edition
+AI Video Pipeline — Full Automated Edition
+1. Groq generates a story + 6 scene descriptions
+2. Gemini Imagen generates 1 image per scene
+3. ffmpeg applies Ken Burns zoom/pan effect to each image
+4. ElevenLabs generates voiceover
+5. ffmpeg combines all clips + audio
+6. YouTube API uploads the final video
 """
 
 import os
 import time
-import tempfile
-import threading
-import requests
 import json
+import tempfile
+import requests
+import subprocess
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs
 
-import gdown
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import google.generativeai as genai
 
-DONE_FILE    = "done.txt"
-DOWNLOAD_DIR = tempfile.gettempdir()
-WAIT_SECONDS = 4 * 3600
+WORK_DIR     = tempfile.gettempdir()
+DONE_FILE    = "done_pipeline.txt"
+WAIT_SECONDS = 24 * 3600  # once per day
 
-DEFAULT_VIDEO = {
-    "url": "https://drive.google.com/file/d/1VJhJFJp_gcvpSoriZ9ZzaGjsFRzNK4kl/view?usp=sharing",
-    "hint": "ronaldo skills goals edit"
-}
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # default: Bella
 
-pending_links = []
-lock = threading.Lock()
 last_post_time = [None]
+lock = threading.Lock()
 
-
+# ── HTML Dashboard ─────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
 <html>
 <head>
-  <title>YouTube Auto Uploader</title>
+  <title>AI Video Pipeline</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; padding: 30px; }}
     h1 {{ color: #ff0000; margin-bottom: 20px; }}
     .card {{ background: #1a1a1a; border-radius: 12px; padding: 24px; max-width: 600px; }}
-    input {{ width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
-      background: #2a2a2a; color: #fff; font-size: 15px; margin-bottom: 12px; }}
-    button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px;
-      border-radius: 8px; font-size: 16px; cursor: pointer; width: 100%; }}
-    button:hover {{ background: #cc0000; }}
-    .status {{ margin-top: 20px; padding: 12px; background: #2a2a2a; border-radius: 8px; font-size: 14px; color: #aaa; }}
-    .queue {{ margin-top: 16px; }}
-    .item {{ background: #222; padding: 10px; border-radius: 6px; margin-bottom: 8px; font-size: 13px; color: #ccc; word-break: break-all; }}
+    .status {{ padding: 12px; background: #2a2a2a; border-radius: 8px; font-size: 14px; color: #aaa; margin-bottom: 16px; }}
+    .log {{ background: #111; border-radius: 8px; padding: 16px; font-size: 12px; color: #0f0; font-family: monospace; max-height: 300px; overflow-y: auto; }}
     h3 {{ margin-bottom: 10px; color: #aaa; font-size: 14px; }}
+    button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px;
+      border-radius: 8px; font-size: 16px; cursor: pointer; margin-top: 16px; }}
+    button:hover {{ background: #cc0000; }}
   </style>
 </head>
 <body>
-  <h1>🎬 YouTube Auto Uploader</h1>
+  <h1>🤖 AI Video Pipeline</h1>
   <div class="card">
-    <h3>PASTE GOOGLE DRIVE LINK</h3>
-    <form method="POST" action="/add">
-      <input name="url" placeholder="https://drive.google.com/file/d/.../view" required />
-      <input name="hint" placeholder="Short description e.g. ronaldo free kick goals" />
-      <button type="submit">🚀 Add to Queue</button>
-    </form>
     <div class="status">
-      📋 In queue: <b>{queue_count}</b> &nbsp;|&nbsp;
-      ✅ Posted: <b>{done_count}</b> &nbsp;|&nbsp;
-      ⏱ Next auto post in: <b>{next_post}</b>
+      ✅ Posted today: <b>{done_count}</b> &nbsp;|&nbsp;
+      ⏱ Next video in: <b>{next_post}</b>
     </div>
-    <div class="queue">
-      <h3>CURRENT QUEUE</h3>
-      {queue_items}
-    </div>
+    <h3>PIPELINE STATUS</h3>
+    <div class="log">{log_content}</div>
+    <form method="POST" action="/trigger">
+      <button type="submit">▶️ Generate & Post Now</button>
+    </form>
   </div>
 </body>
 </html>"""
 
+pipeline_log = ["Pipeline started..."]
+
+def log(msg):
+    print(msg)
+    pipeline_log.append(msg)
+    if len(pipeline_log) > 50:
+        pipeline_log.pop(0)
+
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        with lock:
-            q = list(pending_links)
         done_count = 0
         if os.path.exists(DONE_FILE):
             with open(DONE_FILE) as f:
                 done_count = len([l for l in f if l.strip()])
 
         if last_post_time[0] is None:
-            next_post = "soon (first post)"
+            next_post = "soon"
         else:
             elapsed = time.time() - last_post_time[0]
             remaining = max(0, WAIT_SECONDS - elapsed)
             hrs  = int(remaining // 3600)
             mins = int((remaining % 3600) // 60)
-            next_post = f"{hrs}h {mins}m" if remaining > 0 else "soon"
+            next_post = f"{hrs}h {mins}m"
 
-        items = "".join(
-            f'<div class="item">🔗 {x["url"]}<br><small>{x.get("hint","")}</small></div>'
-            for x in q
-        ) or "<div class='item'>Empty — add a video or wait for auto post!</div>"
-
-        html = HTML.format(queue_count=len(q), done_count=done_count, next_post=next_post, queue_items=items)
+        log_html = "<br>".join(pipeline_log[-30:])
+        html = HTML.format(done_count=done_count, next_post=next_post, log_content=log_html)
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
         self.wfile.write(html.encode())
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body   = self.rfile.read(length).decode()
-        params = parse_qs(body)
-        url    = params.get("url", [""])[0].strip()
-        hint   = params.get("hint", [""])[0].strip()
-        if url:
-            with lock:
-                pending_links.append({"url": url, "hint": hint})
-            print(f"  ➕  Added to queue: {url}")
+        threading.Thread(target=run_pipeline, daemon=True).start()
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
@@ -127,36 +117,226 @@ def start_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-def generate_metadata(hint):
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
-        return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending"}
+# ── Step 1: Generate Story + Scenes ───────────────────────────────────────────
+def generate_story():
+    log("📝 Generating story...")
+    topics = [
+        "a surprising ancient history fact",
+        "a mind-blowing science discovery",
+        "a fascinating true crime story",
+        "an unbelievable survival story",
+        "a weird but true historical event",
+        "a shocking space discovery",
+        "a little-known historical figure who changed the world",
+        "a strange natural phenomenon explained",
+    ]
+    import random
+    topic = random.choice(topics)
+    log(f"  Topic: {topic}")
 
-    prompt = f"""Generate YouTube metadata for a video about: "{hint}"
+    prompt = f"""Write a short, engaging 60-second narration script about: {topic}
+
+Then split it into exactly 6 scenes (each ~10 seconds when read aloud).
+
 Return ONLY valid JSON, no extra text:
 {{
-  "title": "catchy title under 70 chars, no hashtags",
-  "description": "engaging 2-3 sentence description",
-  "hashtags": "#tag1 #tag2 #tag3 #tag4 #tag5 #tag6"
+  "title": "catchy YouTube title under 70 chars",
+  "description": "2-3 sentence description for YouTube",
+  "hashtags": "#history #facts #viral #shorts #fyp #trending",
+  "narration": "full narration script (60 seconds)",
+  "scenes": [
+    {{"scene": 1, "text": "narration for this scene", "image_prompt": "detailed visual description for AI image generation, cinematic, realistic"}},
+    {{"scene": 2, "text": "...", "image_prompt": "..."}},
+    {{"scene": 3, "text": "...", "image_prompt": "..."}},
+    {{"scene": 4, "text": "...", "image_prompt": "..."}},
+    {{"scene": 5, "text": "...", "image_prompt": "..."}},
+    {{"scene": 6, "text": "...", "image_prompt": "..."}}
+  ]
 }}"""
 
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}], "temperature": 0.9},
-            timeout=15
+            timeout=30
         )
         text = res.json()["choices"][0]["message"]["content"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
-        print(f"  🤖  Title: {data['title']}")
+        log(f"  ✅ Title: {data['title']}")
         return data
     except Exception as e:
-        print(f"  ⚠️  Groq failed: {e}")
-        return {"title": hint or "Amazing Video", "description": "Check this out!", "hashtags": "#viral #trending #edit"}
+        log(f"  ❌ Story generation failed: {e}")
+        return None
 
 
+# ── Step 2: Generate Images with Gemini Imagen ────────────────────────────────
+def generate_image(prompt, index):
+    log(f"  🎨 Generating image {index+1}/6...")
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.ImageGenerationModel("imagen-3.0-generate-002")
+        result = model.generate_images(
+            prompt=f"{prompt}, cinematic, high quality, detailed, 16:9 aspect ratio",
+            number_of_images=1,
+            aspect_ratio="16:9",
+        )
+        img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
+        result.images[0].save(img_path)
+        log(f"  ✅ Image {index+1} saved")
+        return img_path
+    except Exception as e:
+        log(f"  ❌ Image {index+1} failed: {e}")
+        # fallback: create a black image
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new("RGB", (1280, 720), color=(20, 20, 40))
+            draw = ImageDraw.Draw(img)
+            draw.text((640, 360), f"Scene {index+1}", fill=(200, 200, 200), anchor="mm")
+            img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
+            img.save(img_path)
+            return img_path
+        except:
+            return None
+
+
+# ── Step 3: Apply Ken Burns Effect ────────────────────────────────────────────
+def image_to_video(img_path, output_path, duration=10, index=0):
+    log(f"  🎬 Creating clip {index+1}/6...")
+    effects = [
+        # zoom in from center
+        "zoompan=z='min(zoom+0.0015,1.5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=250:s=1280x720",
+        # zoom out
+        "zoompan=z='if(lte(zoom,1.0),1.5,max(1.001,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=250:s=1280x720",
+        # pan left to right
+        "zoompan=z='1.3':x='if(lte(on,1),0,x+1.5)':y='ih/2-(ih/zoom/2)':d=250:s=1280x720",
+        # pan right to left
+        "zoompan=z='1.3':x='if(lte(on,1),iw,x-1.5)':y='ih/2-(ih/zoom/2)':d=250:s=1280x720",
+        # zoom in top left
+        "zoompan=z='min(zoom+0.0015,1.5)':x='0':y='0':d=250:s=1280x720",
+        # zoom in bottom right
+        "zoompan=z='min(zoom+0.0015,1.5)':x='iw-(iw/zoom)':y='ih-(ih/zoom)':d=250:s=1280x720",
+    ]
+    effect = effects[index % len(effects)]
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-i", img_path,
+        "-vf", effect,
+        "-t", str(duration),
+        "-r", "25",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        output_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+        log(f"  ✅ Clip {index+1} created")
+        return output_path
+    except Exception as e:
+        log(f"  ❌ Clip {index+1} failed: {e}")
+        return None
+
+
+# ── Step 4: Generate Voiceover ────────────────────────────────────────────────
+def generate_voiceover(narration):
+    log("🎙️ Generating voiceover...")
+    try:
+        res = requests.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "text": narration,
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+            },
+            timeout=60
+        )
+        if res.status_code == 200:
+            audio_path = os.path.join(WORK_DIR, "voiceover.mp3")
+            with open(audio_path, "wb") as f:
+                f.write(res.content)
+            log("  ✅ Voiceover generated")
+            return audio_path
+        else:
+            log(f"  ❌ ElevenLabs error: {res.status_code} {res.text}")
+            return None
+    except Exception as e:
+        log(f"  ❌ Voiceover failed: {e}")
+        return None
+
+
+# ── Step 5: Combine Clips ─────────────────────────────────────────────────────
+def combine_clips(clip_paths, audio_path, output_path):
+    log("🎞️ Combining clips...")
+    concat_file = os.path.join(WORK_DIR, "concat.txt")
+    with open(concat_file, "w") as f:
+        for clip in clip_paths:
+            f.write(f"file '{clip}'\n")
+
+    # First combine video clips
+    combined_video = os.path.join(WORK_DIR, "combined_video.mp4")
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",
+        combined_video
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except Exception as e:
+        log(f"  ❌ Concat failed: {e}")
+        return None
+
+    # Then add audio
+    if audio_path and os.path.exists(audio_path):
+        cmd2 = [
+            "ffmpeg", "-y",
+            "-i", combined_video,
+            "-i", audio_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            output_path
+        ]
+    else:
+        cmd2 = [
+            "ffmpeg", "-y",
+            "-i", combined_video,
+            "-c", "copy",
+            output_path
+        ]
+
+    try:
+        subprocess.run(cmd2, check=True, capture_output=True)
+        duration = get_video_duration(output_path)
+        log(f"  ✅ Final video: {duration:.1f} seconds")
+        return output_path
+    except Exception as e:
+        log(f"  ❌ Audio merge failed: {e}")
+        return None
+
+
+def get_video_duration(path):
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", path],
+            capture_output=True, text=True
+        )
+        info = json.loads(result.stdout)
+        return float(info["format"]["duration"])
+    except:
+        return 0
+
+
+# ── Step 6: Upload to YouTube ─────────────────────────────────────────────────
 def get_youtube_client():
     creds = Credentials(
         token=None,
@@ -167,115 +347,119 @@ def get_youtube_client():
         scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
     creds.refresh(Request())
-    print("✅  Authenticated with YouTube")
     return build("youtube", "v3", credentials=creds)
 
 
-def download_from_drive(url):
-    out = os.path.join(DOWNLOAD_DIR, "video.mp4")
-    if os.path.exists(out):
-        os.remove(out)
+def upload_to_youtube(file_path, title, description, hashtags):
+    log("📤 Uploading to YouTube...")
     try:
-        result = gdown.download(url, out, quiet=False)
-        return result if result and os.path.exists(result) else None
-    except Exception as e:
-        print(f"  ❌  Download failed: {e}")
-        return None
-
-
-def upload_video(youtube, file_path, title, description, is_short=False):
-    final_title = f"{title} #Shorts" if is_short else title
-    body = {
-        "snippet": {"title": final_title[:100], "description": description, "categoryId": "24"},
-        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
-    }
-    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
-    try:
+        youtube = get_youtube_client()
+        body = {
+            "snippet": {
+                "title": title[:100],
+                "description": f"{description}\n\n{hashtags}",
+                "categoryId": "27"  # Education
+            },
+            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
+        }
+        media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
         req = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media)
         response = None
         while response is None:
             status, response = req.next_chunk()
             if status:
-                print(f"    ⬆️  {int(status.progress()*100)}%", end="\r")
+                log(f"  ⬆️ {int(status.progress()*100)}%")
         vid = response.get("id")
-        kind = "Short" if is_short else "Video"
-        print(f"    ✅  {kind} → https://youtube.com/watch?v={vid}    ")
+        log(f"  ✅ Uploaded → https://youtube.com/watch?v={vid}")
+
+        # Also upload as Short
+        body["snippet"]["title"] = f"{title[:94]} #Shorts"
+        media2 = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+        req2 = youtube.videos().insert(part=",".join(body.keys()), body=body, media_body=media2)
+        response2 = None
+        while response2 is None:
+            _, response2 = req2.next_chunk()
+        vid2 = response2.get("id")
+        log(f"  ✅ Short → https://youtube.com/watch?v={vid2}")
         return vid
     except Exception as e:
-        print(f"  ❌  Upload failed: {e}")
+        log(f"  ❌ Upload failed: {e}")
         return None
 
 
-def mark_done(url):
-    with open(DONE_FILE, "a") as f:
-        f.write(url + "\n")
+# ── Main Pipeline ─────────────────────────────────────────────────────────────
+def run_pipeline():
+    log("\n🚀 Starting AI video pipeline...")
 
+    # Step 1: Story
+    story = generate_story()
+    if not story:
+        log("❌ Pipeline aborted: story generation failed")
+        return
 
-def process_video(youtube, item):
-    url  = item["url"]
-    hint = item.get("hint", "viral video")
+    # Step 2: Images
+    images = []
+    for i, scene in enumerate(story["scenes"]):
+        img = generate_image(scene["image_prompt"], i)
+        images.append(img)
+        time.sleep(2)  # rate limit
 
-    print(f"\n📥  Processing: {url}")
-    print(f"  ⬇️  Downloading...")
+    # Step 3: Video clips
+    clips = []
+    for i, img_path in enumerate(images):
+        if img_path:
+            clip_path = os.path.join(WORK_DIR, f"clip_{i}.mp4")
+            clip = image_to_video(img_path, clip_path, duration=10, index=i)
+            if clip:
+                clips.append(clip)
 
-    file_path = download_from_drive(url)
-    if not file_path:
-        print("  ❌  Download failed. Skipping.")
-        return False
+    if not clips:
+        log("❌ Pipeline aborted: no clips generated")
+        return
 
-    size_mb = os.path.getsize(file_path) / (1024*1024)
-    print(f"  📦  {size_mb:.1f} MB")
+    # Step 4: Voiceover
+    audio_path = generate_voiceover(story["narration"])
 
-    meta        = generate_metadata(hint)
-    title       = meta["title"]
-    description = f"{meta['description']}\n\n{meta['hashtags']}"
+    # Step 5: Combine
+    final_path = os.path.join(WORK_DIR, "final_video.mp4")
+    result = combine_clips(clips, audio_path, final_path)
+    if not result:
+        log("❌ Pipeline aborted: combine failed")
+        return
 
-    print(f"  📹  Posting as Video...")
-    upload_video(youtube, file_path, title, description, is_short=False)
-    time.sleep(5)
-    print(f"  🎬  Posting as Short...")
-    upload_video(youtube, file_path, title, description, is_short=True)
+    # Step 6: Upload
+    vid = upload_to_youtube(final_path, story["title"], story["description"], story["hashtags"])
 
-    try:
-        os.remove(file_path)
-    except OSError:
-        pass
+    if vid:
+        with open(DONE_FILE, "a") as f:
+            f.write(f"{time.time()} | {story['title']}\n")
+        last_post_time[0] = time.time()
+        log(f"\n✅ Pipeline complete! Video live on YouTube.\n")
+    else:
+        log("❌ Upload failed")
 
-    mark_done(url)
-    last_post_time[0] = time.time()
-    print(f"  ✅  Done!\n")
-    return True
-
-
-def bot_loop():
-    print("🔄 Authenticating...")
-    while True:
+    # Cleanup
+    for path in images + clips + [audio_path, final_path]:
         try:
-            youtube = get_youtube_client()
-            break
-        except Exception as e:
-            print(f"❌ Auth failed: {e}. Retrying in 30s...")
-            time.sleep(30)
+            if path and os.path.exists(path):
+                os.remove(path)
+        except:
+            pass
 
-    # Post default video immediately on first run
-    print("⏰ First run — posting default video now...")
-    process_video(youtube, DEFAULT_VIDEO)
 
-    print("🤖 Bot running. Will auto post every 4 hours.\n")
+# ── Bot Loop ──────────────────────────────────────────────────────────────────
+def bot_loop():
+    log("🤖 AI Pipeline bot started. Runs once per day.")
+
+    # Run immediately on first start
+    run_pipeline()
 
     while True:
-        with lock:
-            item = pending_links.pop(0) if pending_links else None
-
-        if item:
-            process_video(youtube, item)
-        else:
+        if last_post_time[0] is not None:
             elapsed = time.time() - last_post_time[0]
             if elapsed >= WAIT_SECONDS:
-                print("⏰  4 hours passed, auto posting default video...")
-                process_video(youtube, DEFAULT_VIDEO)
-            else:
-                time.sleep(10)
+                run_pipeline()
+        time.sleep(60)
 
 
 def main():
