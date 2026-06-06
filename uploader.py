@@ -1,7 +1,7 @@
 """
 AI Video Pipeline — Full Automated Edition
 1. Groq generates a story + 6 scene descriptions
-2. Pollinations AI generates 1 image per scene (free, no key needed)
+2. Picsum provides placeholder images (free, no key needed)
 3. ffmpeg applies Ken Burns zoom/pan effect to each image
 4. ElevenLabs generates voiceover
 5. ffmpeg combines all clips + audio
@@ -184,11 +184,9 @@ Return ONLY valid JSON, no extra text, no markdown:
 def generate_image(prompt, index):
     log(f"  🎨 Generating image {index+1}/6...")
     try:
-        encoded_prompt = requests.utils.quote(
-            f"{prompt}, cinematic, high quality, detailed, photorealistic"
-        )
-        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?nologo=true&seed={index}"
-        res = requests.get(url, timeout=60)
+        # Picsum — free random photos, no API key needed
+        url = f"https://picsum.photos/seed/{index}/1280/720"
+        res = requests.get(url, timeout=30)
         res.raise_for_status()
         img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
         with open(img_path, "wb") as f:
@@ -366,7 +364,7 @@ def run_pipeline():
     for i, scene in enumerate(story["scenes"]):
         img = generate_image(scene["image_prompt"], i)
         images.append(img)
-        time.sleep(2)
+        time.sleep(1)
 
     clips = []
     for i, img_path in enumerate(images):
