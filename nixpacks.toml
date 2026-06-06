@@ -1,2 +1,5 @@
+[providers]
+python = {}
+
 [phases.setup]
-pkgs = ["python", "nodejs", "ffmpeg"]
+pkgs = ["python3", "nodejs", "ffmpeg"]
