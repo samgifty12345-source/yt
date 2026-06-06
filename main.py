@@ -32,6 +32,30 @@ GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
+# Write YouTube cookies file from env var or embedded fallback
+COOKIES_PATH = os.path.join(WORK_DIR, "yt_cookies.txt")
+YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie File
+.youtube.com	TRUE	/	TRUE	1815339941	PREF	f4=4000000&f6=40000000&tz=Atlantic.Reykjavik&f7=100
+.youtube.com	TRUE	/	FALSE	1815339931	HSID	AGaPuwG2XwcQiaqoW
+.youtube.com	TRUE	/	TRUE	1815339931	SSID	AbNiADRO4xaZHOxEb
+.youtube.com	TRUE	/	FALSE	1815339931	APISID	N_78NhIgDjtSmC6g/AoQXM3q6USpoGPA74
+.youtube.com	TRUE	/	TRUE	1815339931	SAPISID	t3k8cNGc-g02OGHr/AVACVAUhF0z83og2Q
+.youtube.com	TRUE	/	TRUE	1815339931	__Secure-1PAPISID	t3k8cNGc-g02OGHr/AVACVAUhF0z83og2Q
+.youtube.com	TRUE	/	TRUE	1815339931	__Secure-3PAPISID	t3k8cNGc-g02OGHr/AVACVAUhF0z83og2Q
+.youtube.com	TRUE	/	FALSE	1815339931	SID	g.a000-wiVaauPSgjBbb8z2dcCtThe0EBTTQiI6Qc-0nvVjD3wh45zv6iuCyrlq-NyGgstyOM9PwACgYKAW8SARYSFQHGX2Mi2sbMpuVkCSqGFgDfhW0t4BoVAUF8yKotJqkpYRTEiGqXMr2ARXGt0076
+.youtube.com	TRUE	/	TRUE	1815339931	__Secure-1PSID	g.a000-wiVaauPSgjBbb8z2dcCtThe0EBTTQiI6Qc-0nvVjD3wh45zT2UejOGIkeuCGh6JDgd5VAACgYKAQASARYSFQHGX2MiC6rz4BjpNf6ZvW30ukcXlRoVAUF8yKpZgaZtZ52zldC5xAYbj2oD0076
+.youtube.com	TRUE	/	TRUE	1815339931	__Secure-3PSID	g.a000-wiVaauPSgjBbb8z2dcCtThe0EBTTQiI6Qc-0nvVjD3wh45zfAk-xsMEK6y8H_XbNs0ksgACgYKAfQSARYSFQHGX2MiF2oP1SFS1KoOB3AtdCks6RoVAUF8yKrKmcOHN8c1SM1iRYtfC1qy0076
+.youtube.com	TRUE	/	FALSE	1812315943	SIDCC	AKEyXzWG4jdIlWKcn_WQm1UXUFC4auq_0jpA0gT15qGIIsSOfyf81GVEbO_VAJjM3aVkdv0C-uI
+.youtube.com	TRUE	/	TRUE	1812315943	__Secure-1PSIDCC	AKEyXzWNvgx-W6v9kV-UrSeeOSv-VmyrrshJV3LeDSwj-Q83c6C_-OzLEVNOrvh5Vp68LinZXw
+.youtube.com	TRUE	/	TRUE	1812315943	__Secure-3PSIDCC	AKEyXzVgxqEL7ZpmQKgSyOr3aXyxxEWWA1F7MZdb-vyzKASoBP9eqKpVlo3L4BvudUYSgcmOuA
+.youtube.com	TRUE	/	TRUE	1812315931	__Secure-1PSIDTS	sidts-CjIByojQU61OuuoN6yTCZAPj4dzorlNYLbnZopa7PwhAj4-74uucCMAKd39OPDRo1lKQ7BAA
+.youtube.com	TRUE	/	TRUE	1812315931	__Secure-3PSIDTS	sidts-CjIByojQU61OuuoN6yTCZAPj4dzorlNYLbnZopa7PwhAj4-74uucCMAKd39OPDRo1lKQ7BAA
+.youtube.com	TRUE	/	TRUE	1810559899	LOGIN_INFO	AFmmF2swRAIge0gH08i3OiSk5Lx99mbckfZielz-6FORMK7LJ9GmHJMCIBRJYueJg-NIy48J0g_ph4990pFKnDtltjMClocNKU_i:QUQ3MjNmekdGNUE1Qms2Rk90U3VXN3psMktiZlNfbk9kY0pPLWNxajNOZzJmMWJ6NDBVYi1pbmkya3FDeWM2dHJRZW9XZnNaOHlreFFaSUhJdWtoaW8tRlZXeGJrT0VwTWlzcjFUNDNCSnhLZzBtY2hUUWNFSnV6ZFJoRzlwbEI2N2hmWDc3V0FHc1dPelJEaW5wek1sZ1BMQ3R3UnlWMm5GWldqa3ppVVJQZHhlRllPamZfTDVKTzd3UEZWR2Rxa3ZNenJLejNHc3ZpYzRzMHlsS0s2VHBLVFVURmpHQUZwQQ==
+.youtube.com	TRUE	/	TRUE	0	YSC	YUtssbYL2mQ
+""")
+with open(COOKIES_PATH, "w") as f:
+    f.write(YT_COOKIES)
+
 pipeline_log = ["Pipeline ready... Waiting for a YouTube link."]
 pending_url  = [None]
 lock = threading.Lock()
@@ -118,6 +142,7 @@ def download_video_and_captions(url):
     # Download captions first
     cap_cmd = [
         "yt-dlp",
+        "--cookies", COOKIES_PATH,
         "--write-auto-sub", "--sub-lang", "en",
         "--sub-format", "json3",
         "--skip-download",
@@ -136,6 +161,7 @@ def download_video_and_captions(url):
     # Download video — try simple format first
     vid_cmd = [
         "yt-dlp",
+        "--cookies", COOKIES_PATH,
         "-f", "best[ext=mp4]/best",
         "-o", video_path,
         url
