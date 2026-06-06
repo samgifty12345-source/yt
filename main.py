@@ -127,10 +127,29 @@ def download_video_and_captions(url):
     log("📥 Downloading video + captions...")
     video_path = os.path.join(WORK_DIR, "source_video.mp4")
 
-    # Download captions first
+    # Update yt-dlp silently to ensure n-challenge support is current
+    try:
+        subprocess.run(["yt-dlp", "-U"], capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+    # Base yt-dlp flags shared by all attempts
+    base_flags = [
+        "--cookies", COOKIES_PATH,
+        "--no-cache-dir",
+        "--no-check-certificates",
+        # tv_embedded bypasses the n-challenge JS requirement entirely
+        "--extractor-args", "youtube:player_client=tv_embedded,android",
+        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+    ]
+
+    # Download captions first (no proxy needed)
     cap_cmd = [
         "yt-dlp",
         "--cookies", COOKIES_PATH,
+        "--no-check-certificates",
+        "--extractor-args", "youtube:player_client=tv_embedded,android",
         "--write-auto-sub", "--sub-lang", "en",
         "--sub-format", "json3",
         "--skip-download",
@@ -140,37 +159,41 @@ def download_video_and_captions(url):
     try:
         result = subprocess.run(cap_cmd, capture_output=True, timeout=60, text=True)
         if result.returncode != 0:
-            log(f"  ⚠️ Caption issue: {result.stderr[-300:]}")
+            log(f"  ⚠️ Caption issue: {result.stderr[-200:]}")
         else:
             log("  ✅ Captions downloaded")
     except Exception as e:
         log(f"  ⚠️ Caption download issue: {e}")
 
-    # FIX: Removed invalid --rm-cached-signatures flag.
-    # FIX: Removed skip=dash,hls from extractor-args — it was blocking available formats.
-    # FIX: Added broader format fallback chain so more videos are compatible.
-    vid_cmd = [
-        "yt-dlp",
-        "--cookies", COOKIES_PATH,
+    # Attempt 1: with proxy
+    log("  🔄 Trying download with proxy...")
+    vid_cmd = ["yt-dlp"] + base_flags + [
         "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
-        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "--no-cache-dir",
-        "--no-check-certificates",
-        "--extractor-args", "youtube:player_client=android,web",
         "-o", video_path,
         url
     ]
     try:
         result = subprocess.run(vid_cmd, capture_output=True, timeout=300, text=True)
-        if result.returncode != 0:
-            log(f"  ❌ yt-dlp error: {result.stderr[-500:]}")
-            return None
-        log(f"  ✅ Video downloaded")
-        return video_path
+        if result.returncode == 0:
+            log("  ✅ Video downloaded (via proxy)")
+            return video_path
+        log(f"  ⚠️ Proxy attempt failed: {result.stderr[-200:]}")
     except Exception as e:
-        log(f"  ❌ Video download failed: {e}")
-        return None
+        log(f"  ⚠️ Proxy attempt error: {e}")
+
+    # Attempt 2: without proxy (direct)
+    log("  🔄 Trying download without proxy...")
+    vid_cmd = ["yt-dlp"] + base_flags + ["-o", video_path, url]
+    try:
+        result = subprocess.run(vid_cmd, capture_output=True, timeout=300, text=True)
+        if result.returncode == 0:
+            log("  ✅ Video downloaded (direct)")
+            return video_path
+        log(f"  ❌ Direct attempt failed: {result.stderr[-300:]}")
+    except Exception as e:
+        log(f"  ❌ Direct attempt error: {e}")
+
+    return None
 
 
 def parse_captions():
