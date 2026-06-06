@@ -1,6 +1,6 @@
 """
 AI Video Pipeline — Full Automated Edition
-1. Groq generates a story + 6 scene descriptions
+1. Gemini generates a story + 6 scene descriptions
 2. Gemini Imagen generates 1 image per scene
 3. ffmpeg applies Ken Burns zoom/pan effect to each image
 4. ElevenLabs generates voiceover
@@ -28,7 +28,6 @@ WORK_DIR      = tempfile.gettempdir()
 DONE_FILE     = "done_pipeline.txt"
 WAIT_SECONDS  = 24 * 3600
 
-GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
@@ -158,20 +157,12 @@ Return ONLY valid JSON, no extra text:
 }}"""
 
     try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama3-8b-8192",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.9
-            },
-            timeout=30
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
         )
-        text = res.json()["choices"][0]["message"]["content"].strip()
+        text = response.text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
         log(f"  ✅ Title: {data['title']}")
