@@ -158,12 +158,13 @@ def download_video_and_captions(url):
     except Exception as e:
         log(f"  ⚠️ Caption download issue: {e}")
 
-    # Download video — try simple format first
+    # Modified Video Download Command — Adaptive formats with dynamic ffmpeg merging
     vid_cmd = [
         "yt-dlp",
         "--cookies", COOKIES_PATH,
         "--proxy", "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863",
-        "-f", "best[ext=mp4]/best",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
         "-o", video_path,
         url
     ]
