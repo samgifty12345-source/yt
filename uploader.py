@@ -1,6 +1,6 @@
 """
 AI Video Pipeline — Full Automated Edition
-1. Groq generates a story + 6 scene descriptions
+1. Gemini generates a story + 6 scene descriptions
 2. Gemini Imagen generates 1 image per scene
 3. ffmpeg applies Ken Burns zoom/pan effect to each image
 4. ElevenLabs generates voiceover
@@ -15,6 +15,7 @@ import tempfile
 import requests
 import subprocess
 import threading
+import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from google.oauth2.credentials import Credentials
@@ -27,7 +28,6 @@ WORK_DIR      = tempfile.gettempdir()
 DONE_FILE     = "done_pipeline.txt"
 WAIT_SECONDS  = 24 * 3600
 
-GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
@@ -70,6 +70,7 @@ HTML = """<!DOCTYPE html>
 </html>"""
 
 pipeline_log = ["Pipeline ready..."]
+
 
 def log(msg):
     print(msg)
@@ -116,7 +117,6 @@ def start_server():
 
 def generate_story():
     log("📝 Generating story...")
-    import random
     topics = [
         "a surprising ancient history fact",
         "a mind-blowing science discovery",
@@ -126,6 +126,12 @@ def generate_story():
         "a shocking space discovery",
         "a little-known historical figure who changed the world",
         "a strange natural phenomenon explained",
+        "a bizarre world record that actually exists",
+        "an incredible animal behavior fact",
+        "a little known fact about ancient egypt",
+        "a shocking fact about the human body",
+        "an unbelievable coincidence in history",
+        "a mysterious unsolved historical event",
     ]
     topic = random.choice(topics)
     log(f"  Topic: {topic}")
@@ -151,13 +157,12 @@ Return ONLY valid JSON, no extra text:
 }}"""
 
     try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama3-8b-8192", "messages": [{"role": "user", "content": prompt}], "temperature": 0.9},
-            timeout=30
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
         )
-        text = res.json()["choices"][0]["message"]["content"].strip()
+        text = response.text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
         data = json.loads(text)
         log(f"  ✅ Title: {data['title']}")
@@ -254,7 +259,10 @@ def combine_clips(clip_paths, audio_path, output_path):
             f.write(f"file '{clip}'\n")
 
     combined_video = os.path.join(WORK_DIR, "combined_video.mp4")
-    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file, "-c", "copy", combined_video]
+    cmd = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", concat_file, "-c", "copy", combined_video
+    ]
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except Exception as e:
@@ -264,7 +272,8 @@ def combine_clips(clip_paths, audio_path, output_path):
     if audio_path and os.path.exists(audio_path):
         cmd2 = [
             "ffmpeg", "-y", "-i", combined_video, "-i", audio_path,
-            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", output_path
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+            "-c:a", "aac", "-shortest", output_path
         ]
     else:
         cmd2 = ["ffmpeg", "-y", "-i", combined_video, "-c", "copy", output_path]
@@ -362,6 +371,7 @@ def run_pipeline():
         return
 
     audio_path = generate_voiceover(story["narration"])
+
     final_path = os.path.join(WORK_DIR, "final_video.mp4")
     result = combine_clips(clips, audio_path, final_path)
     if not result:
