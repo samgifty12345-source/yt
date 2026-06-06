@@ -1,9 +1,7 @@
-yt-dlp
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
+google-genai
 gdown
 requests
-google-genai
-elevenlabs
 pillow
