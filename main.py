@@ -125,21 +125,26 @@ def download_video_and_captions(url):
         url
     ]
     try:
-        subprocess.run(cap_cmd, check=True, capture_output=True, timeout=60)
-        log("  ✅ Captions downloaded")
+        result = subprocess.run(cap_cmd, capture_output=True, timeout=60, text=True)
+        if result.returncode != 0:
+            log(f"  ⚠️ Caption issue: {result.stderr[-300:]}")
+        else:
+            log("  ✅ Captions downloaded")
     except Exception as e:
         log(f"  ⚠️ Caption download issue: {e}")
 
-    # Download video (max 1080p, mp4)
+    # Download video — try simple format first
     vid_cmd = [
         "yt-dlp",
-        "-f", "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
+        "-f", "best[ext=mp4]/best",
         "-o", video_path,
         url
     ]
     try:
-        subprocess.run(vid_cmd, check=True, capture_output=True, timeout=300)
+        result = subprocess.run(vid_cmd, capture_output=True, timeout=300, text=True)
+        if result.returncode != 0:
+            log(f"  ❌ yt-dlp error: {result.stderr[-500:]}")
+            return None
         log(f"  ✅ Video downloaded")
         return video_path
     except Exception as e:
