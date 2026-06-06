@@ -22,8 +22,13 @@ ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
 COOKIES_PATH = os.path.join(WORK_DIR, "yt_cookies.txt")
+
+# Fresh YouTube cookies (June 2026) - only youtube.com entries needed by yt-dlp
 YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie File
-.youtube.com	TRUE	/	TRUE	1815339941	PREF	f4=4000000&f6=40000000&tz=Atlantic.Reykjavik&f7=100
+# https://curl.haxx.se/rfc/cookie_spec.html
+# This is a generated file! Do not edit.
+
+.youtube.com	TRUE	/	TRUE	1815345752	PREF	f4=4000000&f6=40000000&tz=Atlantic.Reykjavik&f7=100
 .youtube.com	TRUE	/	FALSE	1815339931	HSID	AGaPuwG2XwcQiaqoW
 .youtube.com	TRUE	/	TRUE	1815339931	SSID	AbNiADRO4xaZHOxEb
 .youtube.com	TRUE	/	FALSE	1815339931	APISID	N_78NhIgDjtSmC6g/AoQXM3q6USpoGPA74
@@ -40,12 +45,21 @@ YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie Fil
 .youtube.com	TRUE	/	TRUE	1812315931	__Secure-3PSIDTS	sidts-CjIByojQU61OuuoN6yTCZAPj4dzorlNYLbnZopa7PwhAj4-74uucCMAKd39OPDRo1lKQ7BAA
 .youtube.com	TRUE	/	TRUE	1810559899	LOGIN_INFO	AFmmF2swRAIge0gH08i3OiSk5Lx99mbckfZielz-6FORMK7LJ9GmHJMCIBRJYueJg-NIy48J0g_ph4990pFKnDtltjMClocNKU_i:QUQ3MjNmekdGNUE1Qms2Rk90U3VXN3psMktiZlNfbk9kY0pPLWNxajNOZzJmMWJ6NDBVYi1pbmkya3FDeWM2dHJRZW9XZnNaOHlreFFaSUhJdWtoaW8tRlZXeGJrT0VwTWlzcjFUNDNCSnhLZzBtY2hUUWNFSnV6ZFJoRzlwbEI2N2hmWDc3V0FHc1dPelJEaW5wek1sZ1BMQ3R3UnlWMm5GWldqa3ppVVJQZHhlRllPamZfTDVKTzd3UEZWR2Rxa3ZNenJLejNHc3ZpYzRzMHlsS0s2VHBLVFVURmpHQUZwQQ==
 .youtube.com	TRUE	/	TRUE	0	YSC	YUtssbYL2mQ
+.youtube.com	TRUE	/	TRUE	1796331931	__Secure-ROLLOUT_TOKEN	CPy1xPDwzsmllgEQhf_9uJi8kwMYspnNmcLzlAM%3D
+.youtube.com	TRUE	/	TRUE	1812321755	__Secure-1PSIDTS	sidts-CjIByojQU7UYtDNBWfi7U4SA0LWEA4vLX7qoI1x93Q4_NTcVqafXr7I-pFc5XYRP8eiT0BAA
+.youtube.com	TRUE	/	TRUE	1812321755	__Secure-3PSIDTS	sidts-CjIByojQU7UYtDNBWfi7U4SA0LWEA4vLX7qoI1x93Q4_NTcVqafXr7I-pFc5XYRP8eiT0BAA
+.youtube.com	TRUE	/	FALSE	1812321756	SIDCC	AKEyXzUvAfWyJ7FSri4lS_L4fnSAPgPvxymLaD6hkdHrMfbSaH654_nB1bO6vEmfWr3YQts8P1Y
+.youtube.com	TRUE	/	TRUE	1812321756	__Secure-1PSIDCC	AKEyXzUajhupFimpcJ2DrRTKGyya-fHqckq4YklTNO8G10iqStFE7bcH9bTR3AnD82PnQV0brw
+.youtube.com	TRUE	/	TRUE	1812321756	__Secure-3PSIDCC	AKEyXzVvv-Yl8X_d2OJ2M4KTRX7uNHUd0LcaIeUGkUuqW0_IRXW1OIQ4nuEg9ouSkHH0bu_kOw
+.youtube.com	TRUE	/	TRUE	1791511288	__Secure-BUCKET	CCI
+.youtube.com	TRUE	/	TRUE	1796337750	VISITOR_INFO1_LIVE	TUsfzSQOuoI
+.youtube.com	TRUE	/	TRUE	1796337750	VISITOR_PRIVACY_METADATA	CgJHSBIEGgAgRA%3D%3D
 """)
+
 with open(COOKIES_PATH, "w") as f:
     f.write(YT_COOKIES)
 
 pipeline_log = ["Pipeline ready... Waiting for a YouTube link."]
-pending_url  = [None]
 lock = threading.Lock()
 
 HTML = """<!DOCTYPE html>
@@ -126,14 +140,13 @@ def download_video_and_captions(url):
     log("📥 Downloading video + captions...")
     video_path = os.path.join(WORK_DIR, "source_video.mp4")
 
-    # Always update yt-dlp first — n-challenge fixes ship constantly
+    # Update yt-dlp
     try:
         r = subprocess.run(["yt-dlp", "-U"], capture_output=True, timeout=60, text=True)
         log(f"  yt-dlp: {r.stdout.strip()[-80:] or 'up to date'}")
     except Exception as e:
         log(f"  ⚠️ yt-dlp update skipped: {e}")
 
-    # FORMAT selector with broad fallback chain
     fmt = (
         "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
         "/bestvideo[ext=mp4]+bestaudio"
@@ -141,23 +154,9 @@ def download_video_and_captions(url):
         "/best"
     )
 
-    # Each attempt is (label, extra_flags)
-    # Strategy:
-    #   1. ios client — no n-challenge, no cookie conflict, no proxy
-    #   2. web client + cookies — standard logged-in, no proxy
-    #   3. ios client + proxy — geo unblock
-    #   4. web client + cookies + proxy
     PROXY = "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863"
 
     attempts = [
-        (
-            "ios (no proxy)",
-            [
-                "--extractor-args", "youtube:player_client=ios",
-                "--no-check-certificates",
-                "--no-cache-dir",
-            ]
-        ),
         (
             "web+cookies (no proxy)",
             [
@@ -168,10 +167,9 @@ def download_video_and_captions(url):
             ]
         ),
         (
-            "ios + proxy",
+            "ios (no proxy)",
             [
                 "--extractor-args", "youtube:player_client=ios",
-                "--proxy", PROXY,
                 "--no-check-certificates",
                 "--no-cache-dir",
             ]
@@ -186,12 +184,22 @@ def download_video_and_captions(url):
                 "--no-cache-dir",
             ]
         ),
+        (
+            "ios + proxy",
+            [
+                "--extractor-args", "youtube:player_client=ios",
+                "--proxy", PROXY,
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
     ]
 
-    # Caption download — try ios first (no cookie conflict)
+    # Caption download
     cap_cmd = [
         "yt-dlp",
-        "--extractor-args", "youtube:player_client=ios",
+        "--cookies", COOKIES_PATH,
+        "--extractor-args", "youtube:player_client=web",
         "--no-check-certificates",
         "--no-cache-dir",
         "--write-auto-sub", "--sub-lang", "en",
@@ -205,28 +213,11 @@ def download_video_and_captions(url):
         if result.returncode == 0:
             log("  ✅ Captions downloaded")
         else:
-            # fallback: try with cookies
-            cap_cmd2 = [
-                "yt-dlp",
-                "--cookies", COOKIES_PATH,
-                "--extractor-args", "youtube:player_client=web",
-                "--no-check-certificates",
-                "--no-cache-dir",
-                "--write-auto-sub", "--sub-lang", "en",
-                "--sub-format", "json3",
-                "--skip-download",
-                "-o", os.path.join(WORK_DIR, "captions"),
-                url
-            ]
-            result2 = subprocess.run(cap_cmd2, capture_output=True, timeout=60, text=True)
-            if result2.returncode == 0:
-                log("  ✅ Captions downloaded (web client)")
-            else:
-                log(f"  ⚠️ Captions unavailable — will use first 60s fallback")
+            log(f"  ⚠️ Captions unavailable — will use first 60s fallback")
     except Exception as e:
         log(f"  ⚠️ Caption download error: {e}")
 
-    # Video download — try each strategy in order
+    # Video download
     for label, extra_flags in attempts:
         log(f"  🔄 Trying: {label}...")
         cmd = ["yt-dlp"] + extra_flags + [
@@ -240,7 +231,6 @@ def download_video_and_captions(url):
             if result.returncode == 0 and os.path.exists(video_path):
                 log(f"  ✅ Video downloaded ({label})")
                 return video_path
-            # Show last 200 chars of stderr for diagnosis
             err = result.stderr[-200:].replace("\n", " ")
             log(f"  ⚠️ Failed ({label}): ...{err}")
         except subprocess.TimeoutExpired:
@@ -253,7 +243,6 @@ def download_video_and_captions(url):
 
 
 def parse_captions():
-    """Find and parse the downloaded caption file, return list of {start, end, text}"""
     files = glob.glob(os.path.join(WORK_DIR, "captions*.json3")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.vtt")) + \
             glob.glob(os.path.join(WORK_DIR, "captions*.json"))
@@ -301,7 +290,6 @@ def parse_captions():
 
 
 def find_best_clip(segments):
-    """Ask Groq to find the most engaging 60-second window"""
     log("🧠 Finding best 60-second moment...")
 
     if not segments:
@@ -496,16 +484,12 @@ def upload_to_youtube(file_path, title, description):
 def run_pipeline(url):
     log(f"\n🚀 Starting pipeline for: {url}")
 
-    # 1. Download
     video_path = download_video_and_captions(url)
     if not video_path:
         log("❌ Aborted: download failed")
         return
 
-    # 2. Parse captions
     segments = parse_captions()
-
-    # 3. Find best clip
     start, end, clip_data = find_best_clip(segments)
     if isinstance(clip_data, dict):
         hook        = clip_data.get("hook", "You won't believe this...")
@@ -514,23 +498,17 @@ def run_pipeline(url):
     else:
         hook, title, description = str(clip_data), "Incredible Moment", "Watch this."
 
-    # 4. Clip video
     clip_path = clip_video(video_path, start, end)
     if not clip_path:
         log("❌ Aborted: clip failed")
         return
 
-    # 5. Generate commentary
     script = generate_commentary(hook, segments, start, end)
-
-    # 6. Voiceover
     voiceover_path = generate_voiceover(script)
 
-    # 7. Mix
     final_path = os.path.join(WORK_DIR, "final_short.mp4")
     mix_audio(clip_path, voiceover_path, final_path)
 
-    # 8. Upload
     vid = upload_to_youtube(final_path, title, description)
     if vid:
         with open(DONE_FILE, "a") as f:
@@ -539,7 +517,6 @@ def run_pipeline(url):
     else:
         log("❌ Upload failed")
 
-    # Cleanup
     for path in [video_path, clip_path, voiceover_path, final_path]:
         try:
             if path and os.path.exists(path):
