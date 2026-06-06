@@ -14,8 +14,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-WORK_DIR     = tempfile.gettempdir()
-DONE_FILE    = "done_pipeline.txt"
+WORK_DIR  = tempfile.gettempdir()
+DONE_FILE = "done_pipeline.txt"
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
@@ -23,7 +23,6 @@ ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMa
 
 COOKIES_PATH = os.path.join(WORK_DIR, "yt_cookies.txt")
 
-# Fresh YouTube cookies (June 2026) - only youtube.com entries needed by yt-dlp
 YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie File
 # https://curl.haxx.se/rfc/cookie_spec.html
 # This is a generated file! Do not edit.
@@ -58,6 +57,20 @@ YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie Fil
 
 with open(COOKIES_PATH, "w") as f:
     f.write(YT_COOKIES)
+
+
+def upgrade_ytdlp():
+    """Force-install latest yt-dlp nightly. Stable (2026.03.17) is 3 months old and broken for YouTube."""
+    try:
+        r = subprocess.run(
+            ["pip", "install", "yt-dlp", "--pre", "--upgrade", "--break-system-packages", "-q"],
+            capture_output=True, timeout=120, text=True
+        )
+        ver = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True).stdout.strip()
+        log(f"  yt-dlp upgraded → {ver}")
+    except Exception as e:
+        log(f"  ⚠️ yt-dlp upgrade failed: {e}")
+
 
 pipeline_log = ["Pipeline ready... Waiting for a YouTube link."]
 lock = threading.Lock()
@@ -140,12 +153,7 @@ def download_video_and_captions(url):
     log("📥 Downloading video + captions...")
     video_path = os.path.join(WORK_DIR, "source_video.mp4")
 
-    # Update yt-dlp
-    try:
-        r = subprocess.run(["yt-dlp", "-U"], capture_output=True, timeout=60, text=True)
-        log(f"  yt-dlp: {r.stdout.strip()[-80:] or 'up to date'}")
-    except Exception as e:
-        log(f"  ⚠️ yt-dlp update skipped: {e}")
+    upgrade_ytdlp()
 
     fmt = (
         "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]"
@@ -156,6 +164,10 @@ def download_video_and_captions(url):
 
     PROXY = "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863"
 
+    # Strategy:
+    # - web client supports cookies, requires JS for n-challenge (nightly has fixes)
+    # - ios client does NOT accept cookie files (yt-dlp limitation) — no --cookies flag
+    # - mweb client is lighter, sometimes bypasses bot detection
     attempts = [
         (
             "web+cookies (no proxy)",
@@ -167,7 +179,16 @@ def download_video_and_captions(url):
             ]
         ),
         (
-            "ios (no proxy)",
+            "mweb+cookies (no proxy)",
+            [
+                "--cookies", COOKIES_PATH,
+                "--extractor-args", "youtube:player_client=mweb",
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
+        (
+            "ios (no proxy, no cookies)",
             [
                 "--extractor-args", "youtube:player_client=ios",
                 "--no-check-certificates",
@@ -185,7 +206,17 @@ def download_video_and_captions(url):
             ]
         ),
         (
-            "ios + proxy",
+            "mweb+cookies + proxy",
+            [
+                "--cookies", COOKIES_PATH,
+                "--extractor-args", "youtube:player_client=mweb",
+                "--proxy", PROXY,
+                "--no-check-certificates",
+                "--no-cache-dir",
+            ]
+        ),
+        (
+            "ios + proxy (no cookies)",
             [
                 "--extractor-args", "youtube:player_client=ios",
                 "--proxy", PROXY,
@@ -196,26 +227,28 @@ def download_video_and_captions(url):
     ]
 
     # Caption download
-    cap_cmd = [
-        "yt-dlp",
-        "--cookies", COOKIES_PATH,
-        "--extractor-args", "youtube:player_client=web",
-        "--no-check-certificates",
-        "--no-cache-dir",
-        "--write-auto-sub", "--sub-lang", "en",
-        "--sub-format", "json3",
-        "--skip-download",
-        "-o", os.path.join(WORK_DIR, "captions"),
-        url
-    ]
-    try:
-        result = subprocess.run(cap_cmd, capture_output=True, timeout=60, text=True)
-        if result.returncode == 0:
-            log("  ✅ Captions downloaded")
-        else:
-            log(f"  ⚠️ Captions unavailable — will use first 60s fallback")
-    except Exception as e:
-        log(f"  ⚠️ Caption download error: {e}")
+    for cap_client in ["web", "mweb"]:
+        cap_cmd = [
+            "yt-dlp",
+            "--cookies", COOKIES_PATH,
+            "--extractor-args", f"youtube:player_client={cap_client}",
+            "--no-check-certificates",
+            "--no-cache-dir",
+            "--write-auto-sub", "--sub-lang", "en",
+            "--sub-format", "json3",
+            "--skip-download",
+            "-o", os.path.join(WORK_DIR, "captions"),
+            url
+        ]
+        try:
+            result = subprocess.run(cap_cmd, capture_output=True, timeout=60, text=True)
+            if result.returncode == 0:
+                log(f"  ✅ Captions downloaded ({cap_client})")
+                break
+        except Exception:
+            pass
+    else:
+        log(f"  ⚠️ Captions unavailable — will use first 60s fallback")
 
     # Video download
     for label, extra_flags in attempts:
@@ -296,9 +329,7 @@ def find_best_clip(segments):
         log("  ⚠️ No captions — using first 60 seconds")
         return 0, 60, {"hook": "You won't believe this...", "title": "Incredible Moment", "description": "Watch this amazing clip."}
 
-    transcript_lines = []
-    for s in segments[:300]:
-        transcript_lines.append(f"[{s['start']:.1f}s] {s['text']}")
+    transcript_lines = [f"[{s['start']:.1f}s] {s['text']}" for s in segments[:300]]
     transcript = "\n".join(transcript_lines)
 
     prompt = f"""You are a YouTube Shorts editor. Find the single most engaging, surprising, or emotional 60-second moment in this transcript.
@@ -308,14 +339,12 @@ TRANSCRIPT:
 
 Return ONLY valid JSON:
 {{
-  "start_seconds": <number - start time in seconds>,
+  "start_seconds": <number>,
   "end_seconds": <number - exactly 60 seconds after start>,
   "hook": "one punchy sentence teasing what happens",
   "title": "short viral YouTube title under 60 chars",
   "description": "2-3 sentence description"
-}}
-
-start_seconds and end_seconds must be exactly 60 seconds apart."""
+}}"""
 
     try:
         res = requests.post(
@@ -330,9 +359,8 @@ start_seconds and end_seconds must be exactly 60 seconds apart."""
         data = json.loads(text)
         start = float(data["start_seconds"])
         end = float(data["end_seconds"])
-        hook = data.get("hook", "You won't believe this...")
         log(f"  ✅ Best moment: {start:.0f}s - {end:.0f}s")
-        log(f"  🎣 Hook: {hook}")
+        log(f"  🎣 Hook: {data.get('hook', '')}")
         return start, end, data
     except Exception as e:
         log(f"  ⚠️ AI selection failed ({e}) — using first 60s")
@@ -342,12 +370,10 @@ start_seconds and end_seconds must be exactly 60 seconds apart."""
 def clip_video(video_path, start, end):
     log(f"✂️ Clipping {start:.0f}s - {end:.0f}s...")
     clip_path = os.path.join(WORK_DIR, "clip.mp4")
-    duration = end - start
     cmd = [
         "ffmpeg", "-y",
-        "-ss", str(start),
-        "-i", video_path,
-        "-t", str(duration),
+        "-ss", str(start), "-i", video_path,
+        "-t", str(end - start),
         "-c:v", "libx264", "-c:a", "aac",
         "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
         clip_path
@@ -364,21 +390,11 @@ def clip_video(video_path, start, end):
 def generate_commentary(hook, segments, start, end):
     log("📝 Generating commentary script...")
     window_text = " ".join(s["text"] for s in segments if start <= s["start"] <= end)
-
-    prompt = f"""Write a short, punchy 15-second spoken commentary for a YouTube Short.
-
-The clip is about: {hook}
-What happens in the clip: {window_text[:500]}
-
-Rules:
-- Start with a hook like "You won't believe..." or "Wait till you see..."
-- Maximum 40 words
-- Conversational, excited tone
-- End with a cliffhanger or reaction
-- No hashtags, no emojis
-
-Return ONLY the spoken script text, nothing else."""
-
+    prompt = f"""Write a punchy 15-second spoken commentary for a YouTube Short.
+Clip is about: {hook}
+What happens: {window_text[:500]}
+Rules: max 40 words, hook opener, conversational, cliffhanger ending, no hashtags/emojis.
+Return ONLY the script text."""
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -398,7 +414,7 @@ Return ONLY the spoken script text, nothing else."""
 def generate_voiceover(script):
     log("🎙️ Generating voiceover...")
     if not ELEVENLABS_API_KEY:
-        log("  ⚠️ No ElevenLabs key — skipping voiceover")
+        log("  ⚠️ No ElevenLabs key — skipping")
         return None
     try:
         res = requests.post(
@@ -413,9 +429,8 @@ def generate_voiceover(script):
                 f.write(res.content)
             log("  ✅ Voiceover generated")
             return audio_path
-        else:
-            log(f"  ❌ ElevenLabs error: {res.status_code}")
-            return None
+        log(f"  ❌ ElevenLabs error: {res.status_code}")
+        return None
     except Exception as e:
         log(f"  ❌ Voiceover failed: {e}")
         return None
@@ -427,14 +442,10 @@ def mix_audio(clip_path, voiceover_path, output_path):
         cmd = ["ffmpeg", "-y", "-i", clip_path, "-c", "copy", output_path]
     else:
         cmd = [
-            "ffmpeg", "-y",
-            "-i", clip_path,
-            "-i", voiceover_path,
-            "-filter_complex",
-            "[0:a]volume=0.2[a1];[1:a]volume=1.0[a2];[a1][a2]amix=inputs=2:duration=first[aout]",
+            "ffmpeg", "-y", "-i", clip_path, "-i", voiceover_path,
+            "-filter_complex", "[0:a]volume=0.2[a1];[1:a]volume=1.0[a2];[a1][a2]amix=inputs=2:duration=first[aout]",
             "-map", "0:v", "-map", "[aout]",
-            "-c:v", "copy", "-c:a", "aac", "-shortest",
-            output_path
+            "-c:v", "copy", "-c:a", "aac", "-shortest", output_path
         ]
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=120)
@@ -459,11 +470,7 @@ def upload_to_youtube(file_path, title, description):
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
         body = {
-            "snippet": {
-                "title": title[:100],
-                "description": f"{description}\n\n#shorts #viral #fyp",
-                "categoryId": "22"
-            },
+            "snippet": {"title": title[:100], "description": f"{description}\n\n#shorts #viral #fyp", "categoryId": "22"},
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
         }
         media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
@@ -491,12 +498,9 @@ def run_pipeline(url):
 
     segments = parse_captions()
     start, end, clip_data = find_best_clip(segments)
-    if isinstance(clip_data, dict):
-        hook        = clip_data.get("hook", "You won't believe this...")
-        title       = clip_data.get("title", "Incredible Moment")
-        description = clip_data.get("description", "Watch this amazing clip.")
-    else:
-        hook, title, description = str(clip_data), "Incredible Moment", "Watch this."
+    hook        = clip_data.get("hook", "You won't believe this...") if isinstance(clip_data, dict) else str(clip_data)
+    title       = clip_data.get("title", "Incredible Moment") if isinstance(clip_data, dict) else "Incredible Moment"
+    description = clip_data.get("description", "Watch this.") if isinstance(clip_data, dict) else "Watch this."
 
     clip_path = clip_video(video_path, start, end)
     if not clip_path:
