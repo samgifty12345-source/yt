@@ -330,7 +330,7 @@ def clip_video(video_path, start, end):
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start), "-i", video_path, "-t", str(end - start),
-        "-c:v", "libx264", "-c:a", "aac",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac",
         "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
         clip_path
     ]
