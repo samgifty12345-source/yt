@@ -200,7 +200,7 @@ def download_from_youtube(url):
     except Exception as e:
         log(f"  ⚠️ yt-dlp upgrade skipped: {e}")
 
-    fmt = "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best"
+    fmt = "best"
     PROXY = "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863"
 
     attempts = [
