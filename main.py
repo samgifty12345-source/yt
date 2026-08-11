@@ -236,16 +236,20 @@ def concat_clips(clip_paths):
     return combined_path
 
 
-def generate_narration(full_script):
-    log("Generating narration voiceover...")
+ELEVENLABS_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
+GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "playai-tts")
+GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "Fritz-PlayAI")
+
+
+def _try_elevenlabs(full_script):
     if not ELEVENLABS_API_KEY:
-        log("  No ElevenLabs key - video will have no narration")
+        log("  No ElevenLabs key - skipping")
         return None
     try:
         res = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
             headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json={"text": full_script, "model_id": "eleven_monolingual_v1",
+            json={"text": full_script, "model_id": ELEVENLABS_MODEL_ID,
                   "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
             timeout=60,
         )
@@ -257,8 +261,48 @@ def generate_narration(full_script):
         log(f"  ElevenLabs error {res.status_code}: {res.text[:200]}")
         return None
     except Exception as e:
-        log(f"  Narration failed: {e}")
+        log(f"  ElevenLabs failed: {e}")
         return None
+
+
+def _try_groq_tts(full_script):
+    if not GROQ_API_KEY:
+        log("  No Groq key - skipping")
+        return None
+    try:
+        # PlayAI TTS caps input length (~10k tokens) but also has a practical
+        # per-request character limit on some accounts; script is short (~150
+        # words) so this is comfortably within range.
+        res = requests.post(
+            "https://api.groq.com/openai/v1/audio/speech",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={"model": GROQ_TTS_MODEL, "input": full_script,
+                  "voice": GROQ_TTS_VOICE, "response_format": "wav"},
+            timeout=60,
+        )
+        if res.status_code == 200:
+            audio_path = os.path.join(WORK_DIR, "narration.wav")
+            with open(audio_path, "wb") as f:
+                f.write(res.content)
+            return audio_path
+        log(f"  Groq TTS error {res.status_code}: {res.text[:200]}")
+        return None
+    except Exception as e:
+        log(f"  Groq TTS failed: {e}")
+        return None
+
+
+def generate_narration(full_script):
+    log("Generating narration voiceover...")
+    audio_path = _try_elevenlabs(full_script)
+    if audio_path:
+        return audio_path
+    log("  Falling back to Groq PlayAI TTS...")
+    audio_path = _try_groq_tts(full_script)
+    if audio_path:
+        return audio_path
+    log("  All TTS options failed - video will have no narration")
+    return None
 
 
 def mux_narration(video_path, audio_path, output_path):
