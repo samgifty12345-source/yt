@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import base64
 import tempfile
 import requests
 import subprocess
@@ -13,11 +12,13 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+from huggingface_hub import InferenceClient
+
 WORK_DIR = tempfile.gettempdir()
 DONE_FILE = "done_history.txt"
 
 GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
-NVIDIA_API_KEY       = os.environ.get("NVIDIA_API_KEY", "")
+HF_TOKEN             = os.environ.get("HF_TOKEN", "")
 ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
@@ -28,7 +29,7 @@ NICHE_PROMPT = os.environ.get(
     "Ancient history and forgotten historical events, told dramatically but 100% factually accurate."
 )
 
-# Consistency style baked into every image prompt since Qwen-Image has no
+# Consistency style baked into every image prompt since HF Inference has no
 # reference-image conditioning like Gemini did.
 STYLE_SUFFIX = os.environ.get(
     "STYLE_SUFFIX",
@@ -38,7 +39,8 @@ STYLE_SUFFIX = os.environ.get(
 # How often the bot generates + posts a video on its own, fully unattended.
 AUTOPILOT_INTERVAL_HOURS = float(os.environ.get("AUTOPILOT_INTERVAL_HOURS", "24"))
 
-NVIDIA_IMAGE_MODEL = os.environ.get("NVIDIA_IMAGE_MODEL", "qwen/qwen-image")
+# Free-tier Hugging Face model. Leave unset to use the default.
+HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 
 NUM_SCENES = 6          # 6 scenes x 10s = 60s video
 SCENE_SECONDS = 10
@@ -183,22 +185,13 @@ def generate_scene_image(image_prompt, index):
         f"A cinematic illustration, vertical 9:16 composition, no text or watermarks, "
         f"{STYLE_SUFFIX}: {image_prompt}"
     )
-    res = requests.post(
-        "https://integrate.api.nvidia.com/v1/images/generations",
-        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": NVIDIA_IMAGE_MODEL,
-            "prompt": full_prompt,
-            "n": 1,
-            "response_format": "b64_json",
-        },
-        timeout=90,
+    client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
+    image = client.text_to_image(
+        full_prompt,
+        model=HF_IMAGE_MODEL,
     )
-    res.raise_for_status()
-    b64 = res.json()["data"][0]["b64_json"]
     img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-    with open(img_path, "wb") as f:
-        f.write(base64.b64decode(b64))
+    image.save(img_path)
     return img_path
 
 
