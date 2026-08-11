@@ -35,7 +35,7 @@ FISH_AUDIO_MODEL = os.environ.get("FISH_AUDIO_MODEL", "s2.1-pro-free")
 
 DEFAULT_NICHE = os.environ.get(
     "NICHE_PROMPT",
-    "Any story you find intresting and would not miss to wacth if you saw the thinnail doesnt have to be history . this is an eapmle Title: "I Answered a Fake Job Listing... And Showed Up to an Empty Warehouse"Thumbnail Idea: Your avatar sweating with wide eyes, holding a glowing phone that says "ARRIVED," standing in front of a dark, creaky warehouse door. Bold yellow text: "IT WASN'T A JOB."Script / Narration Concept[0:00 - 0:15] The Hook"If you ever get offered $40 an hour to literally just 'watch a door,' do yourself a favor... block the number. Because two years ago, I was broke enough to actually take that offer. And it almost cost me everything."[0:15 - 0:45] The SetupVisual: Avatar scrolling on a laptop late at night, aggressively clicking the mouse.Narration: Break down the situation quickly. You were hunting for remote work or quick cash gigs online. You hit page five of a job board and found an ad with zero requirements, a sketchy email address, and an absurd pay rate for overnight shift coverage.[0:45 - 1:30] The Journey & ArrivalVisual: Avatar driving or taking a bus into a completely deserted industrial area as the sky turns pitch black.Narration: Describe the location. It wasn't an office building; the GPS led to a dead-end street near abandoned storage units. The employer texts: "Go to Door 4. It's unlocked. Do not turn on the lights."[1:30 - 2:30] The Tension BuildVisual: Dark silhouette animations, heavy shadow effects, flashlight beam cutting through fog/dust.Narration: You walk inside. The atmosphere is completely off. No furniture, no equipment—just a single folding chair in the middle of a massive room facing a closed steel door. Your phone battery is at 12%. Suddenly, you hear footfalls on the roof, followed by a metallic clunk right outside the door you're supposed to be watching.[2:30 - 3:15] The ClimaxVisual: Fast-paced action cuts. Avatar backing away slowly, phone screen lit up with missed calls from a restricted number.Narration: The handle on the steel door starts turning. Slow, heavy pressure. You reach into your pocket, grab your keys, and decide right then and there that $40 an hour isn't worth whatever is on the other side. You bolt for the exit just as the heavy door swings open behind you.[3:15 - 3:45] The Aftermath / TwistVisual: Avatar safe at home in bed, staring blankly at a phone screen.Narration: You make it back to your car and tear out of there. The next morning, you check the job listing to report it—it’s completely deleted. But at 3:00 AM, you get one final text from the unknown number: "Thanks for holding the perimeter."."
+    "Ancient history and forgotten historical events, told dramatically ."
 )
 
 STYLE_SUFFIX = os.environ.get(
@@ -64,7 +64,7 @@ POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 # (e.g. a file hosted in your own GitHub repo - NOT a signed/expiring link
 # from a site like audio.com, and NOT a track marked "All Rights Reserved").
 BACKGROUND_MUSIC_URL = os.environ.get("BACKGROUND_MUSIC_URL", "")
-BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.42"))
+BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.32"))
 
 # How strongly generated scenes should match the reference image's style
 # (0 = ignore reference, 1 = match it very closely). 0.5 is a good default:
