@@ -17,12 +17,18 @@ from huggingface_hub import InferenceClient
 WORK_DIR = tempfile.gettempdir()
 DONE_FILE = "done_history.txt"
 
-GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
-HF_TOKEN             = os.environ.get("HF_TOKEN", "")
-ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-# Edit this anytime in Railway's Variables tab to change the channel's niche.
+# Fish Audio TTS (https://docs.fish.audio) - primary narration voice.
+FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY", "")
+# reference_id of a voice from your Fish Audio account (or a public model id).
+# Leave blank to use the model's default voice.
+FISH_AUDIO_VOICE_ID = os.environ.get("FISH_AUDIO_VOICE_ID", "")
+# "s2.1-pro-free" is free; "s2.1-pro" is the paid/higher-latency-priority tier.
+FISH_AUDIO_MODEL = os.environ.get("FISH_AUDIO_MODEL", "s2.1-pro-free")
+
+# Edit this anytime in your host's env var settings to change the channel's niche.
 # No code changes or redeploy of code needed - just update the variable.
 NICHE_PROMPT = os.environ.get(
     "NICHE_PROMPT",
@@ -236,74 +242,44 @@ def concat_clips(clip_paths):
     return combined_path
 
 
-ELEVENLABS_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
-# playai-tts was decommissioned by Groq in favor of Orpheus (Canopy Labs).
-GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
-GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")  # other options: diana, hannah, austin, daniel, troy
-
-
-def _try_elevenlabs(full_script):
-    if not ELEVENLABS_API_KEY:
-        log("  No ElevenLabs key - skipping")
+def generate_narration(full_script):
+    """Fish Audio TTS. https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech"""
+    log("Generating narration voiceover (Fish Audio)...")
+    if not FISH_AUDIO_API_KEY:
+        log("  No FISH_AUDIO_API_KEY set - video will have no narration")
         return None
+
+    payload = {
+        "text": full_script,
+        "format": "mp3",
+        "mp3_bitrate": 128,
+        "normalize": True,
+        "chunk_length": 300,
+    }
+    if FISH_AUDIO_VOICE_ID:
+        payload["reference_id"] = FISH_AUDIO_VOICE_ID
+
     try:
         res = requests.post(
-            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json={"text": full_script, "model_id": ELEVENLABS_MODEL_ID,
-                  "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
-            timeout=60,
+            "https://api.fish.audio/v1/tts",
+            headers={
+                "Authorization": f"Bearer {FISH_AUDIO_API_KEY}",
+                "Content-Type": "application/json",
+                "model": FISH_AUDIO_MODEL,
+            },
+            json=payload,
+            timeout=120,
         )
         if res.status_code == 200:
             audio_path = os.path.join(WORK_DIR, "narration.mp3")
             with open(audio_path, "wb") as f:
                 f.write(res.content)
             return audio_path
-        log(f"  ElevenLabs error {res.status_code}: {res.text[:200]}")
+        log(f"  Fish Audio error {res.status_code}: {res.text[:300]}")
         return None
     except Exception as e:
-        log(f"  ElevenLabs failed: {e}")
+        log(f"  Fish Audio failed: {e}")
         return None
-
-
-def _try_groq_tts(full_script):
-    if not GROQ_API_KEY:
-        log("  No Groq key - skipping")
-        return None
-    try:
-        # PlayAI TTS caps input length (~10k tokens) but also has a practical
-        # per-request character limit on some accounts; script is short (~150
-        # words) so this is comfortably within range.
-        res = requests.post(
-            "https://api.groq.com/openai/v1/audio/speech",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": GROQ_TTS_MODEL, "input": full_script,
-                  "voice": GROQ_TTS_VOICE, "response_format": "wav"},
-            timeout=60,
-        )
-        if res.status_code == 200:
-            audio_path = os.path.join(WORK_DIR, "narration.wav")
-            with open(audio_path, "wb") as f:
-                f.write(res.content)
-            return audio_path
-        log(f"  Groq TTS error {res.status_code}: {res.text[:200]}")
-        return None
-    except Exception as e:
-        log(f"  Groq TTS failed: {e}")
-        return None
-
-
-def generate_narration(full_script):
-    log("Generating narration voiceover...")
-    audio_path = _try_elevenlabs(full_script)
-    if audio_path:
-        return audio_path
-    log("  Falling back to Groq PlayAI TTS...")
-    audio_path = _try_groq_tts(full_script)
-    if audio_path:
-        return audio_path
-    log("  All TTS options failed - video will have no narration")
-    return None
 
 
 def mux_narration(video_path, audio_path, output_path):
@@ -345,11 +321,11 @@ def upload_to_youtube(file_path, title, description):
 
 def run_pipeline():
     log("\nStarting new history short...")
+    clip_paths, combined, narration_path, final_path = [], None, None, None
     try:
         story = generate_story()
         full_narration = " ".join(s["narration"] for s in story["scenes"])
 
-        clip_paths = []
         for i, scene in enumerate(story["scenes"]):
             img_path = generate_scene_image(scene["image_prompt"], i)
             clip_path = image_to_clip(img_path, i, SCENE_SECONDS)
@@ -368,15 +344,15 @@ def run_pipeline():
         else:
             log("Upload failed - pipeline stopped")
 
+    except Exception as e:
+        log(f"Pipeline error: {e}")
+    finally:
         for p in clip_paths + [combined, narration_path, final_path]:
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
             except Exception:
                 pass
-
-    except Exception as e:
-        log(f"Pipeline error: {e}")
 
 
 def autopilot_loop():
