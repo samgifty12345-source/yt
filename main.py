@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import tempfile
 import requests
 import subprocess
@@ -15,9 +16,9 @@ from googleapiclient.http import MediaFileUpload
 WORK_DIR = tempfile.gettempdir()
 DONE_FILE = "done_history.txt"
 
-GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
-GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
+NVIDIA_API_KEY       = os.environ.get("NVIDIA_API_KEY", "")
+ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
 # Edit this anytime in Railway's Variables tab to change the channel's niche.
@@ -27,11 +28,17 @@ NICHE_PROMPT = os.environ.get(
     "Ancient history and forgotten historical events, told dramatically but 100% factually accurate."
 )
 
-# A link to an image of your cartoon style, used to keep every scene visually consistent.
-REFERENCE_IMAGE_URL = os.environ.get("REFERENCE_IMAGE_URL", "")
+# Consistency style baked into every image prompt since Qwen-Image has no
+# reference-image conditioning like Gemini did.
+STYLE_SUFFIX = os.environ.get(
+    "STYLE_SUFFIX",
+    "flat 2D cartoon illustration style, muted earth tones, thick black outlines, consistent character design"
+)
 
 # How often the bot generates + posts a video on its own, fully unattended.
 AUTOPILOT_INTERVAL_HOURS = float(os.environ.get("AUTOPILOT_INTERVAL_HOURS", "24"))
+
+NVIDIA_IMAGE_MODEL = os.environ.get("NVIDIA_IMAGE_MODEL", "qwen/qwen-image")
 
 NUM_SCENES = 6          # 6 scenes x 10s = 60s video
 SCENE_SECONDS = 10
@@ -172,38 +179,27 @@ Return ONLY valid JSON, no markdown fences, in this exact shape:
 
 def generate_scene_image(image_prompt, index):
     log(f"  Generating image {index + 1}/{NUM_SCENES}...")
-    from google import genai
-    from google.genai import types
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    parts = []
-
-    if REFERENCE_IMAGE_URL:
-        try:
-            ref_bytes = requests.get(REFERENCE_IMAGE_URL, timeout=30).content
-            parts.append(types.Part.from_bytes(data=ref_bytes, mime_type="image/png"))
-        except Exception as e:
-            log(f"    Could not fetch reference image: {e}")
-
     full_prompt = (
-        f"In the exact same cartoon art style as the reference image provided, draw: {image_prompt}. "
-        f"Vertical 9:16 composition, no text, no watermarks, no captions."
-        if REFERENCE_IMAGE_URL else
-        f"A cinematic cartoon illustration, vertical 9:16 composition, no text or watermarks: {image_prompt}"
+        f"A cinematic illustration, vertical 9:16 composition, no text or watermarks, "
+        f"{STYLE_SUFFIX}: {image_prompt}"
     )
-    parts.append(full_prompt)
-
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-image",
-        contents=parts,
+    res = requests.post(
+        "https://integrate.api.nvidia.com/v1/images/generations",
+        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": NVIDIA_IMAGE_MODEL,
+            "prompt": full_prompt,
+            "n": 1,
+            "response_format": "b64_json",
+        },
+        timeout=90,
     )
-    for part in response.candidates[0].content.parts:
-        if part.inline_data:
-            img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-            with open(img_path, "wb") as f:
-                f.write(part.inline_data.data)
-            return img_path
-    raise RuntimeError("No image returned")
+    res.raise_for_status()
+    b64 = res.json()["data"][0]["b64_json"]
+    img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
+    with open(img_path, "wb") as f:
+        f.write(base64.b64decode(b64))
+    return img_path
 
 
 def image_to_clip(img_path, index, seconds):
