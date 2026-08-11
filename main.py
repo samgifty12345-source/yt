@@ -65,6 +65,12 @@ HF_IMAGE_PROVIDERS = [
 # reliably than the "nologo" query param alone.
 POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 
+# Optional background music track, mixed under the narration at low volume.
+# Point this at a direct URL to an mp3 (royalty-free track). Leave blank to
+# skip background music entirely.
+BACKGROUND_MUSIC_URL = os.environ.get("BACKGROUND_MUSIC_URL", "")
+BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.12"))
+
 NUM_SCENES = 6          # 6 scenes x 10s = 60s video
 SCENE_SECONDS = 10
 
@@ -306,16 +312,51 @@ def generate_narration(full_script):
         return None
 
 
+def get_background_music():
+    if not BACKGROUND_MUSIC_URL:
+        return None
+    try:
+        log("Downloading background music...")
+        res = requests.get(BACKGROUND_MUSIC_URL, timeout=60)
+        res.raise_for_status()
+        music_path = os.path.join(WORK_DIR, "music.mp3")
+        with open(music_path, "wb") as f:
+            f.write(res.content)
+        return music_path
+    except Exception as e:
+        log(f"  Background music download failed: {e}")
+        return None
+
+
 def mux_narration(video_path, audio_path, output_path):
     log("Adding narration to video...")
-    if not audio_path:
+    music_path = get_background_music()
+
+    if not audio_path and not music_path:
         cmd = ["ffmpeg", "-y", "-i", video_path, "-c", "copy", output_path]
-    else:
+    elif audio_path and not music_path:
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
             "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
         ]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+    elif music_path and not audio_path:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-stream_loop", "-1", "-i", music_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac",
+            "-filter:a", f"volume={BACKGROUND_MUSIC_VOLUME}", "-shortest", output_path,
+        ]
+    else:
+        log("  Mixing narration + background music...")
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+            "-stream_loop", "-1", "-i", music_path,
+            "-filter_complex",
+            f"[1:a]volume=1.0[narr];[2:a]volume={BACKGROUND_MUSIC_VOLUME}[music];"
+            f"[narr][music]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
+        ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
     return output_path
 
 
