@@ -5,6 +5,7 @@ import tempfile
 import requests
 import subprocess
 import threading
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from google.oauth2.credentials import Credentials
@@ -56,6 +57,13 @@ HF_IMAGE_PROVIDERS = [
     p.strip() for p in os.environ.get("HF_IMAGE_PROVIDERS", "nscale,fal-ai,hf-inference").split(",")
     if p.strip()
 ]
+
+# Pollinations (https://pollinations.ai) - free, key-less last-resort image
+# fallback used only when every HF provider above fails (out of credits,
+# deprecated model, etc). Set POLLINATIONS_TOKEN if you register a free
+# account - raises the anonymous rate limit and removes the watermark more
+# reliably than the "nologo" query param alone.
+POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 
 NUM_SCENES = 6          # 6 scenes x 10s = 60s video
 SCENE_SECONDS = 10
@@ -212,6 +220,22 @@ def generate_scene_image(image_prompt, index):
         except Exception as e:
             last_err = e
             log(f"    provider '{provider}' failed ({e}), trying next...")
+
+    # Last resort: Pollinations - free, key-less, no HF credits needed.
+    try:
+        log("    all HF providers failed, trying pollinations...")
+        url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full_prompt)}"
+        params = {"width": 1080, "height": 1920, "nologo": "true", "model": "flux"}
+        if POLLINATIONS_TOKEN:
+            params["token"] = POLLINATIONS_TOKEN
+        res = requests.get(url, params=params, timeout=90)
+        res.raise_for_status()
+        with open(img_path, "wb") as f:
+            f.write(res.content)
+        return img_path
+    except Exception as e:
+        last_err = e
+        log(f"    provider 'pollinations' failed ({e})")
 
     raise RuntimeError(f"All image providers failed. Last error: {last_err}")
 
