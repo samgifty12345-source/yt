@@ -40,7 +40,7 @@ DEFAULT_NICHE = os.environ.get(
 
 STYLE_SUFFIX = os.environ.get(
     "STYLE_SUFFIX",
-    "flat 2D cartoon illustration style, muted earth tones, thick black outlines, consistent character design"
+    "flat 2D cartoon illustration style, muted earth tones, thick black outlines, consistent character design. only one face should be consistent the rest dorfent because the previius ones where all lookng like the same eprso 5times i=evry face "
 )
 
 # How often autopilot posts once it's running on its own schedule.
