@@ -237,8 +237,9 @@ def concat_clips(clip_paths):
 
 
 ELEVENLABS_MODEL_ID = os.environ.get("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2")
-GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "playai-tts")
-GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "Fritz-PlayAI")
+# playai-tts was decommissioned by Groq in favor of Orpheus (Canopy Labs).
+GROQ_TTS_MODEL = os.environ.get("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
+GROQ_TTS_VOICE = os.environ.get("GROQ_TTS_VOICE", "autumn")  # other options: diana, hannah, austin, daniel, troy
 
 
 def _try_elevenlabs(full_script):
