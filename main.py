@@ -23,98 +23,78 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # Fish Audio TTS (https://docs.fish.audio) - primary narration voice.
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY", "")
-# reference_id of a voice from your Fish Audio account (or a public model id).
-# Leave blank to use the model's default voice.
 FISH_AUDIO_VOICE_ID = os.environ.get("FISH_AUDIO_VOICE_ID", "")
-# "s2.1-pro-free" is free; "s2.1-pro" is the paid/higher-latency-priority tier.
 FISH_AUDIO_MODEL = os.environ.get("FISH_AUDIO_MODEL", "s2.1-pro-free")
 
-# Edit this anytime in your host's env var settings to change the channel's niche.
-# No code changes or redeploy of code needed - just update the variable.
-NICHE_PROMPT = os.environ.get(
+DEFAULT_NICHE = os.environ.get(
     "NICHE_PROMPT",
     "Ancient history and forgotten historical events, told dramatically but 100% factually accurate."
 )
 
-# Consistency style baked into every image prompt since HF Inference has no
-# reference-image conditioning like Gemini did.
 STYLE_SUFFIX = os.environ.get(
     "STYLE_SUFFIX",
     "flat 2D cartoon illustration style, muted earth tones, thick black outlines, consistent character design"
 )
 
-# How often the bot generates + posts a video on its own, fully unattended.
+# How often autopilot posts once it's running on its own schedule.
 AUTOPILOT_INTERVAL_HOURS = float(os.environ.get("AUTOPILOT_INTERVAL_HOURS", "24"))
 
-# Free-tier Hugging Face model. Leave unset to use the default.
+# How long the bot waits after boot before its FIRST unattended run, so you
+# have a window to open the site and set topic/duration/orientation first.
+# Visiting the site and hitting "Generate Now" at any point cancels the wait.
+STARTUP_WAIT_HOURS = float(os.environ.get("STARTUP_WAIT_HOURS", "2"))
+
 HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 
-# Ordered list of HF Inference Providers to try for image generation. HF has
-# been reshuffling which providers serve which models (hf-inference dropped
-# FLUX.1-schnell entirely in July 2026 with a 410), so we fall through a list
-# instead of hardcoding one provider. Override via env if needed, comma-separated.
 HF_IMAGE_PROVIDERS = [
     p.strip() for p in os.environ.get("HF_IMAGE_PROVIDERS", "nscale,fal-ai,hf-inference").split(",")
     if p.strip()
 ]
 
-# Pollinations (https://pollinations.ai) - free, key-less last-resort image
-# fallback used only when every HF provider above fails (out of credits,
-# deprecated model, etc). Set POLLINATIONS_TOKEN if you register a free
-# account - raises the anonymous rate limit and removes the watermark more
-# reliably than the "nologo" query param alone.
 POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 
-# Optional background music track, mixed under the narration at low volume.
-# Point this at a direct URL to an mp3 (royalty-free track). Leave blank to
-# skip background music entirely.
+# Point this at a direct URL to an mp3 you actually own/have rights to use
+# (e.g. a file hosted in your own GitHub repo - NOT a signed/expiring link
+# from a site like audio.com, and NOT a track marked "All Rights Reserved").
 BACKGROUND_MUSIC_URL = os.environ.get("BACKGROUND_MUSIC_URL", "")
-BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.12"))
+BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.42"))
 
-NUM_SCENES = 6          # 6 scenes x 10s = 60s video
-SCENE_SECONDS = 10
+SCENE_SECONDS = 10  # each scene/image is on screen this long
 
-pipeline_log = ["History bot ready. Waiting for first autopilot run or manual trigger."]
-lock = threading.Lock()
+# Orientation presets: (width, height, description used in prompts)
+ORIENTATIONS = {
+    "shorts": {"w": 1080, "h": 1920, "aspect_text": "vertical 9:16", "max_seconds": 180},
+    "long":   {"w": 1920, "h": 1080, "aspect_text": "horizontal 16:9", "max_seconds": 600},
+}
 
-HTML = """<!DOCTYPE html>
-<html>
-<head>
-  <title>AI History Shorts Bot</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: Arial, sans-serif; background: #0f0f0f; color: #fff; padding: 30px; }}
-    h1 {{ color: #ff0000; margin-bottom: 20px; }}
-    .card {{ background: #1a1a1a; border-radius: 12px; padding: 24px; max-width: 600px; }}
-    .status {{ padding: 12px; background: #2a2a2a; border-radius: 8px; font-size: 14px; color: #aaa; margin-bottom: 16px; }}
-    .log {{ background: #111; border-radius: 8px; padding: 16px; font-size: 12px; color: #0f0; font-family: monospace; max-height: 400px; overflow-y: auto; margin-bottom: 16px; white-space: pre-wrap; }}
-    button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px; border-radius: 8px; font-size: 16px; cursor: pointer; }}
-    button:hover {{ background: #cc0000; }}
-    .niche {{ color: #888; font-size: 13px; margin-bottom: 16px; }}
-  </style>
-</head>
-<body>
-  <h1>AI History Shorts Bot</h1>
-  <div class="card">
-    <div class="status">Posted: <b>{done_count}</b> | Autopilot every <b>{interval}h</b></div>
-    <div class="niche">Niche: {niche}</div>
-    <h3 style="color:#aaa;font-size:14px;margin-bottom:10px;">PIPELINE STATUS</h3>
-    <div class="log">{log_content}</div>
-    <form method="POST" action="/trigger">
-      <button type="submit">Generate & Post Now</button>
-    </form>
-  </div>
-</body>
-</html>"""
+pipeline_log = ["History bot ready. Waiting for the startup window or a manual trigger."]
+log_lock = threading.Lock()
+
+pipeline_state_lock = threading.Lock()
+pipeline_running = False
+
+trigger_event = threading.Event()
+next_run_at = [time.time() + STARTUP_WAIT_HOURS * 3600]  # mutable box for cross-thread read
+
+config_lock = threading.Lock()
+CONFIG = {
+    "topic": DEFAULT_NICHE,
+    "duration_seconds": 60,
+    "orientation": "shorts",
+}
 
 
 def log(msg):
     print(msg, flush=True)
-    with lock:
+    with log_lock:
         pipeline_log.append(msg)
         if len(pipeline_log) > 80:
             pipeline_log.pop(0)
+
+
+def get_config():
+    with config_lock:
+        return dict(CONFIG)
 
 
 def get_google_creds(scopes):
@@ -128,29 +108,254 @@ def get_google_creds(scopes):
     )
 
 
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AI History Shorts Bot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0b0b10;
+    --panel: #14141c;
+    --panel-2: #1b1b26;
+    --border: #26263a;
+    --text: #eaeaf2;
+    --muted: #8a8aa0;
+    --accent: #ff3b5c;
+    --accent-2: #7c5cff;
+    --ok: #35d488;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(124,92,255,0.18), transparent 60%),
+      radial-gradient(1000px 500px at 100% 0%, rgba(255,59,92,0.14), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    padding: 32px 20px 60px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 18px; flex-shrink: 0;
+  }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+  @media (min-width: 720px) { .grid { grid-template-columns: 1fr 1fr; } }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+  }
+  .card h2 {
+    font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin: 0 0 16px;
+  }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .badge {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 999px; padding: 6px 12px; font-size: 12.5px; color: var(--muted);
+  }
+  .badge b { color: var(--text); }
+  .badge.running { color: var(--ok); border-color: rgba(53,212,136,0.35); background: rgba(53,212,136,0.08); }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 6px; }
+  label:first-of-type { margin-top: 0; }
+  textarea, input[type=number] {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; color: var(--text); font-size: 14px;
+    font-family: inherit; resize: vertical;
+  }
+  textarea:focus, input:focus { outline: none; border-color: var(--accent-2); }
+  .row { display: flex; gap: 10px; align-items: center; }
+  .row input[type=number] { width: 90px; }
+  .toggle { display: flex; gap: 8px; margin-top: 4px; }
+  .toggle label {
+    flex: 1; margin: 0; text-align: center; cursor: pointer;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; font-size: 13px; color: var(--muted); transition: all .15s;
+  }
+  .toggle input { display: none; }
+  .toggle input:checked + label {
+    color: #fff; border-color: var(--accent-2);
+    background: linear-gradient(135deg, rgba(124,92,255,0.25), rgba(255,59,92,0.2));
+  }
+  button {
+    width: 100%; margin-top: 18px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    color: #fff; border: none; padding: 13px; border-radius: 10px;
+    font-size: 14.5px; font-weight: 600; cursor: pointer; letter-spacing: 0.01em;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.secondary {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  }
+  .log {
+    background: #08080d; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; font-size: 12px; color: #8fe3a8; font-family: "SF Mono", Menlo, Consolas, monospace;
+    max-height: 360px; overflow-y: auto; white-space: pre-wrap; line-height: 1.5;
+  }
+  .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+  footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">AI</div>
+    <div>
+      <h1>History Shorts Bot</h1>
+      <div class="sub">Unattended AI research &rarr; script &rarr; voice &rarr; video &rarr; YouTube pipeline</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Status</h2>
+      <div class="badges">
+        <div class="badge">Posted <b>@@DONE_COUNT@@</b></div>
+        <div class="badge">Autopilot every <b>@@INTERVAL@@h</b></div>
+        <div class="badge @@RUNNING_CLASS@@">@@RUNNING_TEXT@@</div>
+      </div>
+      <div class="log">@@LOG_CONTENT@@</div>
+      <form method="POST" action="/trigger">
+        <button type="submit">Generate &amp; Post Now</button>
+      </form>
+      <div class="hint">Triggering now cancels any wait/schedule and starts immediately with the settings on the right.</div>
+    </div>
+
+    <div class="card">
+      <h2>Configure Next Video</h2>
+      <form method="POST" action="/configure">
+        <label>Topic / niche</label>
+        <textarea name="topic" rows="3" placeholder="e.g. The Bronze Age Collapse">@@TOPIC@@</textarea>
+
+        <label>Orientation</label>
+        <div class="toggle">
+          <input type="radio" id="o_shorts" name="orientation" value="shorts" @@SHORTS_CHECKED@@>
+          <label for="o_shorts">Short (vertical)</label>
+          <input type="radio" id="o_long" name="orientation" value="long" @@LONG_CHECKED@@>
+          <label for="o_long">Long-form (horizontal)</label>
+        </div>
+
+        <label>Duration</label>
+        <div class="row">
+          <input type="number" name="duration_minutes" min="0.25" max="10" step="0.25" value="@@DURATION_MINUTES@@">
+          <span class="sub">minutes (~@@SCENE_COUNT@@ scenes)</span>
+        </div>
+
+        <button type="submit" class="secondary">Save Settings</button>
+      </form>
+      <div class="hint">
+        Shorts are capped at 3 min, long-form at 10 min. Settings persist until you change them again,
+        and apply to both manual and autopilot runs.
+      </div>
+    </div>
+  </div>
+
+  <footer>First unattended run waits @@STARTUP_WAIT@@h after boot &middot; next run in @@NEXT_RUN_IN@@</footer>
+</div>
+</body>
+</html>"""
+
+
+def format_countdown(target_epoch):
+    remaining = int(target_epoch - time.time())
+    if remaining <= 0:
+        return "any moment"
+    h, rem = divmod(remaining, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def render_page():
+    done_count = 0
+    if os.path.exists(DONE_FILE):
+        with open(DONE_FILE) as f:
+            done_count = len([l for l in f if l.strip()])
+    with log_lock:
+        log_text = "\n".join(pipeline_log[-40:])
+    with pipeline_state_lock:
+        running = pipeline_running
+
+    cfg = get_config()
+    duration_minutes = round(cfg["duration_seconds"] / 60, 2)
+    scene_count = max(1, round(cfg["duration_seconds"] / SCENE_SECONDS))
+
+    html = PAGE_TEMPLATE
+    html = html.replace("@@DONE_COUNT@@", str(done_count))
+    html = html.replace("@@INTERVAL@@", str(AUTOPILOT_INTERVAL_HOURS))
+    html = html.replace("@@RUNNING_CLASS@@", "running" if running else "")
+    html = html.replace("@@RUNNING_TEXT@@", "Running now" if running else "Idle")
+    html = html.replace("@@LOG_CONTENT@@", log_text)
+    html = html.replace("@@TOPIC@@", cfg["topic"])
+    html = html.replace("@@SHORTS_CHECKED@@", "checked" if cfg["orientation"] == "shorts" else "")
+    html = html.replace("@@LONG_CHECKED@@", "checked" if cfg["orientation"] == "long" else "")
+    html = html.replace("@@DURATION_MINUTES@@", str(duration_minutes))
+    html = html.replace("@@SCENE_COUNT@@", str(scene_count))
+    html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
+    html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
+    return html
+
+
+def parse_post_body(handler):
+    length = int(handler.headers.get("Content-Length", 0))
+    body = handler.rfile.read(length).decode() if length else ""
+    return {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        done_count = 0
-        if os.path.exists(DONE_FILE):
-            with open(DONE_FILE) as f:
-                done_count = len([l for l in f if l.strip()])
-        with lock:
-            log_html = "\n".join(pipeline_log[-40:])
-        html = HTML.format(
-            done_count=done_count,
-            interval=AUTOPILOT_INTERVAL_HOURS,
-            niche=NICHE_PROMPT,
-            log_content=log_html,
-        )
+        html = render_page()
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        body = html.encode()
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(html.encode())
+        self.wfile.write(body)
 
     def do_POST(self):
-        threading.Thread(target=run_pipeline, daemon=True).start()
+        if self.path == "/configure":
+            fields = parse_post_body(self)
+            with config_lock:
+                if fields.get("topic", "").strip():
+                    CONFIG["topic"] = fields["topic"].strip()
+                orientation = fields.get("orientation", CONFIG["orientation"])
+                if orientation not in ORIENTATIONS:
+                    orientation = CONFIG["orientation"]
+                CONFIG["orientation"] = orientation
+                try:
+                    minutes = float(fields.get("duration_minutes", 1))
+                except ValueError:
+                    minutes = 1.0
+                seconds = minutes * 60
+                cap = ORIENTATIONS[orientation]["max_seconds"]
+                seconds = max(SCENE_SECONDS, min(seconds, cap))
+                CONFIG["duration_seconds"] = seconds
+            log(f"Settings updated -> orientation={orientation}, "
+                f"duration={seconds/60:.2f}min, topic='{CONFIG['topic'][:60]}'")
+        elif self.path == "/trigger":
+            log("Manual trigger received - starting now.")
+            trigger_event.set()
+
         self.send_response(303)
         self.send_header("Location", "/")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def log_message(self, *args):
@@ -162,7 +367,11 @@ def start_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-def groq_chat(prompt, temperature=0.8, max_tokens=1200):
+# ---------------------------------------------------------------------------
+# Content pipeline
+# ---------------------------------------------------------------------------
+
+def groq_chat(prompt, temperature=0.8, max_tokens=1800):
     res = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -178,40 +387,46 @@ def groq_chat(prompt, temperature=0.8, max_tokens=1200):
     return res.json()["choices"][0]["message"]["content"].strip()
 
 
-def generate_story():
-    log("Picking a topic and writing a factual script...")
-    prompt = f"""You are a history channel scriptwriter. Your channel's niche: {NICHE_PROMPT}
+def generate_story(topic, num_scenes):
+    total_seconds = num_scenes * SCENE_SECONDS
+    log(f"Picking a topic and writing a factual script (~{total_seconds}s, {num_scenes} scenes)...")
+    prompt = f"""You are a history channel scriptwriter. Your channel's niche/topic focus: {topic}
 
-Pick ONE specific, genuinely interesting REAL historical topic or event within that niche.
+Pick ONE specific, genuinely interesting REAL historical topic or event within that focus.
 Every fact you include must be historically accurate - do not invent or exaggerate details.
-Write a punchy, cinematic ~130-150 word narration script about it, split into exactly {NUM_SCENES} scenes
-of roughly equal length (about {SCENE_SECONDS} seconds of spoken narration each).
+Write a punchy, cinematic narration script about it, split into exactly {num_scenes} scenes
+of roughly equal length (about {SCENE_SECONDS} seconds of spoken narration each, so aim for
+roughly {int(total_seconds * 2.3)} words total across all scenes combined).
 
 For each scene also write a short visual description (image_prompt) of what should be drawn to
 illustrate that part of the narration - concrete, vivid, specific (people, setting, action).
+
+Also return 5-8 relevant hashtags for the video (no # symbol, no spaces, lowercase).
 
 Return ONLY valid JSON, no markdown fences, in this exact shape:
 {{
   "title": "viral YouTube title under 60 chars, no clickbait lies",
   "description": "2-3 sentence accurate description",
+  "hashtags": ["ancienthistory", "..."],
   "scenes": [
     {{"narration": "...", "image_prompt": "..."}},
-    ... exactly {NUM_SCENES} of these ...
+    ... exactly {num_scenes} of these ...
   ]
 }}"""
     raw = groq_chat(prompt)
     raw = raw.replace("```json", "").replace("```", "").strip()
     data = json.loads(raw)
-    if len(data.get("scenes", [])) != NUM_SCENES:
-        raise ValueError(f"Expected {NUM_SCENES} scenes, got {len(data.get('scenes', []))}")
+    if len(data.get("scenes", [])) != num_scenes:
+        raise ValueError(f"Expected {num_scenes} scenes, got {len(data.get('scenes', []))}")
     log(f"  Topic: {data['title']}")
     return data
 
 
-def generate_scene_image(image_prompt, index):
-    log(f"  Generating image {index + 1}/{NUM_SCENES}...")
+def generate_scene_image(image_prompt, index, num_scenes, orientation):
+    log(f"  Generating image {index + 1}/{num_scenes}...")
+    dims = ORIENTATIONS[orientation]
     full_prompt = (
-        f"A cinematic illustration, vertical 9:16 composition, no text or watermarks, "
+        f"A cinematic illustration, {dims['aspect_text']} composition, no text or watermarks, "
         f"{STYLE_SUFFIX}: {image_prompt}"
     )
     img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
@@ -227,11 +442,10 @@ def generate_scene_image(image_prompt, index):
             last_err = e
             log(f"    provider '{provider}' failed ({e}), trying next...")
 
-    # Last resort: Pollinations - free, key-less, no HF credits needed.
     try:
         log("    all HF providers failed, trying pollinations...")
         url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full_prompt)}"
-        params = {"width": 1080, "height": 1920, "nologo": "true", "model": "flux"}
+        params = {"width": dims["w"], "height": dims["h"], "nologo": "true", "model": "flux"}
         if POLLINATIONS_TOKEN:
             params["token"] = POLLINATIONS_TOKEN
         res = requests.get(url, params=params, timeout=90)
@@ -246,13 +460,15 @@ def generate_scene_image(image_prompt, index):
     raise RuntimeError(f"All image providers failed. Last error: {last_err}")
 
 
-def image_to_clip(img_path, index, seconds):
+def image_to_clip(img_path, index, seconds, orientation):
+    dims = ORIENTATIONS[orientation]
+    w, h = dims["w"], dims["h"]
     clip_path = os.path.join(WORK_DIR, f"clip_{index}.mp4")
     frames = int(25 * seconds)
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", img_path,
-        "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-               f"zoompan=z='min(zoom+0.0018,1.4)':d={frames}:s=1080x1920:fps=25",
+        "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+               f"zoompan=z='min(zoom+0.0018,1.4)':d={frames}:s={w}x{h}:fps=25",
         "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
         "-pix_fmt", "yuv420p", clip_path,
     ]
@@ -273,7 +489,6 @@ def concat_clips(clip_paths):
 
 
 def generate_narration(full_script):
-    """Fish Audio TTS. https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech"""
     log("Generating narration voiceover (Fish Audio)...")
     if not FISH_AUDIO_API_KEY:
         log("  No FISH_AUDIO_API_KEY set - video will have no narration")
@@ -346,7 +561,7 @@ def mux_narration(video_path, audio_path, output_path):
             "-filter:a", f"volume={BACKGROUND_MUSIC_VOLUME}", "-shortest", output_path,
         ]
     else:
-        log("  Mixing narration + background music...")
+        log(f"  Mixing narration + background music (music at {BACKGROUND_MUSIC_VOLUME}x volume)...")
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
             "-stream_loop", "-1", "-i", music_path,
@@ -356,19 +571,37 @@ def mux_narration(video_path, audio_path, output_path):
             "-map", "0:v", "-map", "[aout]",
             "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
         ]
-    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+    subprocess.run(cmd, check=True, capture_output=True, timeout=180)
     return output_path
 
 
-def upload_to_youtube(file_path, title, description):
+def build_hashtags(story, orientation):
+    tags = story.get("hashtags", []) or []
+    clean = []
+    for t in tags:
+        t = "".join(ch for ch in t if ch.isalnum())
+        if t:
+            clean.append(f"#{t}")
+    if orientation == "shorts":
+        clean.append("#Shorts")
+    # de-dupe, keep order
+    seen = set()
+    out = []
+    for t in clean:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return " ".join(out)
+
+
+def upload_to_youtube(file_path, title, description, orientation):
     log("Uploading to YouTube...")
     try:
         creds = get_google_creds(["https://www.googleapis.com/auth/youtube.upload"])
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
         body = {
-            "snippet": {"title": title[:100], "description": f"{description}\n\n#shorts #history",
-                        "categoryId": "27"},
+            "snippet": {"title": title[:100], "description": description, "categoryId": "27"},
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
         }
         media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
@@ -385,15 +618,26 @@ def upload_to_youtube(file_path, title, description):
 
 
 def run_pipeline():
-    log("\nStarting new history short...")
+    global pipeline_running
+    with pipeline_state_lock:
+        if pipeline_running:
+            log("Pipeline already running - ignoring this trigger.")
+            return
+        pipeline_running = True
+
+    log("\nStarting new history video...")
     clip_paths, combined, narration_path, final_path = [], None, None, None
     try:
-        story = generate_story()
+        cfg = get_config()
+        orientation = cfg["orientation"]
+        num_scenes = max(1, round(cfg["duration_seconds"] / SCENE_SECONDS))
+
+        story = generate_story(cfg["topic"], num_scenes)
         full_narration = " ".join(s["narration"] for s in story["scenes"])
 
         for i, scene in enumerate(story["scenes"]):
-            img_path = generate_scene_image(scene["image_prompt"], i)
-            clip_path = image_to_clip(img_path, i, SCENE_SECONDS)
+            img_path = generate_scene_image(scene["image_prompt"], i, num_scenes, orientation)
+            clip_path = image_to_clip(img_path, i, SCENE_SECONDS, orientation)
             clip_paths.append(clip_path)
 
         combined = concat_clips(clip_paths)
@@ -401,7 +645,10 @@ def run_pipeline():
         final_path = os.path.join(WORK_DIR, "final_history.mp4")
         mux_narration(combined, narration_path, final_path)
 
-        vid = upload_to_youtube(final_path, story["title"], story["description"])
+        hashtags = build_hashtags(story, orientation)
+        description = f"{story['description']}\n\n{hashtags}".strip()
+
+        vid = upload_to_youtube(final_path, story["title"], description, orientation)
         if vid:
             with open(DONE_FILE, "a") as f:
                 f.write(f"{time.time()} | {story['title']}\n")
@@ -418,19 +665,29 @@ def run_pipeline():
                     os.remove(p)
             except Exception:
                 pass
+        with pipeline_state_lock:
+            pipeline_running = False
 
 
 def autopilot_loop():
+    wait_seconds = STARTUP_WAIT_HOURS * 3600
+    log(f"Startup window: waiting {STARTUP_WAIT_HOURS}h before the first unattended run. "
+        f"Visit the site to configure the topic/duration/orientation, or click "
+        f"'Generate & Post Now' to skip the wait.")
     while True:
+        next_run_at[0] = time.time() + wait_seconds
+        triggered = trigger_event.wait(timeout=wait_seconds)
+        trigger_event.clear()
         run_pipeline()
-        log(f"Sleeping {AUTOPILOT_INTERVAL_HOURS}h until next autopilot run...")
-        time.sleep(AUTOPILOT_INTERVAL_HOURS * 3600)
+        wait_seconds = AUTOPILOT_INTERVAL_HOURS * 3600
+        log(f"Sleeping {AUTOPILOT_INTERVAL_HOURS}h until next autopilot run "
+            f"(or trigger manually anytime)...")
 
 
 def main():
     threading.Thread(target=start_server, daemon=True).start()
     threading.Thread(target=autopilot_loop, daemon=True).start()
-    log("Bot started. First autopilot run begins immediately, then repeats on schedule.")
+    log("Bot started.")
     while True:
         time.sleep(60)
 
