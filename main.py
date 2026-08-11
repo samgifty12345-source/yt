@@ -21,6 +21,11 @@ DONE_FILE = "done_history.txt"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
+# Stability AI (https://platform.stability.ai) - fallback #2 for image gen,
+# used if all HF providers fail. Uses Stable Image Core (cheap, 3 credits/gen).
+STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY", "")
+STABILITY_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/generate/core"
+
 # Fish Audio TTS (https://docs.fish.audio) - primary narration voice.
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY", "")
 FISH_AUDIO_VOICE_ID = os.environ.get("FISH_AUDIO_VOICE_ID", "")
@@ -62,9 +67,10 @@ BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.42"
 SCENE_SECONDS = 10  # each scene/image is on screen this long
 
 # Orientation presets: (width, height, description used in prompts)
+# stability_ar is the closest supported Stability aspect_ratio for that shape.
 ORIENTATIONS = {
-    "shorts": {"w": 1080, "h": 1920, "aspect_text": "vertical 9:16", "max_seconds": 180},
-    "long":   {"w": 1920, "h": 1080, "aspect_text": "horizontal 16:9", "max_seconds": 600},
+    "shorts": {"w": 1080, "h": 1920, "aspect_text": "vertical 9:16", "max_seconds": 180, "stability_ar": "9:16"},
+    "long":   {"w": 1920, "h": 1080, "aspect_text": "horizontal 16:9", "max_seconds": 600, "stability_ar": "16:9"},
 }
 
 pipeline_log = ["History bot ready. Waiting for the startup window or a manual trigger."]
@@ -422,28 +428,61 @@ Return ONLY valid JSON, no markdown fences, in this exact shape:
     return data
 
 
-def generate_scene_image(image_prompt, index, num_scenes, orientation):
-    log(f"  Generating image {index + 1}/{num_scenes}...")
-    dims = ORIENTATIONS[orientation]
-    full_prompt = (
-        f"A cinematic illustration, {dims['aspect_text']} composition, no text or watermarks, "
-        f"{STYLE_SUFFIX}: {image_prompt}"
-    )
-    img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-
+def _try_huggingface_image(full_prompt, img_path):
+    """Try each configured HF provider in order. Returns True on success."""
     last_err = None
     for provider in HF_IMAGE_PROVIDERS:
         try:
             client = InferenceClient(provider=provider, api_key=HF_TOKEN)
             image = client.text_to_image(full_prompt, model=HF_IMAGE_MODEL)
             image.save(img_path)
-            return img_path
+            return True
         except Exception as e:
             last_err = e
             log(f"    provider '{provider}' failed ({e}), trying next...")
+    if last_err:
+        log(f"    all HF providers exhausted, last error: {last_err}")
+    return False
 
+
+def _try_stability_image(full_prompt, img_path, orientation):
+    """Fallback #2: Stability AI Stable Image Core. Returns True on success."""
+    if not STABILITY_API_KEY:
+        log("    no STABILITY_API_KEY set - skipping Stability AI fallback")
+        return False
     try:
-        log("    all HF providers failed, trying pollinations...")
+        log("    trying Stability AI (Stable Image Core)...")
+        aspect_ratio = ORIENTATIONS[orientation]["stability_ar"]
+        res = requests.post(
+            STABILITY_ENDPOINT,
+            headers={
+                "authorization": f"Bearer {STABILITY_API_KEY}",
+                "accept": "image/*",
+            },
+            files={"none": ""},
+            data={
+                "prompt": full_prompt,
+                "aspect_ratio": aspect_ratio,
+                "output_format": "png",
+            },
+            timeout=60,
+        )
+        if res.status_code == 200:
+            with open(img_path, "wb") as f:
+                f.write(res.content)
+            return True
+        log(f"    Stability AI error {res.status_code}: {res.text[:300]}")
+        return False
+    except Exception as e:
+        log(f"    Stability AI failed: {e}")
+        return False
+
+
+def _try_pollinations_image(full_prompt, img_path, orientation):
+    """Fallback #3: Pollinations (free, no key needed)."""
+    try:
+        log("    trying Pollinations...")
+        dims = ORIENTATIONS[orientation]
         url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(full_prompt)}"
         params = {"width": dims["w"], "height": dims["h"], "nologo": "true", "model": "flux"}
         if POLLINATIONS_TOKEN:
@@ -452,12 +491,31 @@ def generate_scene_image(image_prompt, index, num_scenes, orientation):
         res.raise_for_status()
         with open(img_path, "wb") as f:
             f.write(res.content)
-        return img_path
+        return True
     except Exception as e:
-        last_err = e
-        log(f"    provider 'pollinations' failed ({e})")
+        log(f"    Pollinations failed: {e}")
+        return False
 
-    raise RuntimeError(f"All image providers failed. Last error: {last_err}")
+
+def generate_scene_image(image_prompt, index, num_scenes, orientation):
+    log(f"  Generating image {index + 1}/{num_scenes}...")
+    full_prompt = (
+        f"A cinematic illustration, {ORIENTATIONS[orientation]['aspect_text']} composition, "
+        f"no text or watermarks, {STYLE_SUFFIX}: {image_prompt}"
+    )
+    img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
+
+    # Fallback chain: Hugging Face providers -> Stability AI -> Pollinations
+    if _try_huggingface_image(full_prompt, img_path):
+        return img_path
+
+    if _try_stability_image(full_prompt, img_path, orientation):
+        return img_path
+
+    if _try_pollinations_image(full_prompt, img_path, orientation):
+        return img_path
+
+    raise RuntimeError("All image providers failed (Hugging Face, Stability AI, Pollinations).")
 
 
 def image_to_clip(img_path, index, seconds, orientation):
