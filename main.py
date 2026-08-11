@@ -42,6 +42,15 @@ AUTOPILOT_INTERVAL_HOURS = float(os.environ.get("AUTOPILOT_INTERVAL_HOURS", "24"
 # Free-tier Hugging Face model. Leave unset to use the default.
 HF_IMAGE_MODEL = os.environ.get("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
 
+# Ordered list of HF Inference Providers to try for image generation. HF has
+# been reshuffling which providers serve which models (hf-inference dropped
+# FLUX.1-schnell entirely in July 2026 with a 410), so we fall through a list
+# instead of hardcoding one provider. Override via env if needed, comma-separated.
+HF_IMAGE_PROVIDERS = [
+    p.strip() for p in os.environ.get("HF_IMAGE_PROVIDERS", "nscale,fal-ai,hf-inference").split(",")
+    if p.strip()
+]
+
 NUM_SCENES = 6          # 6 scenes x 10s = 60s video
 SCENE_SECONDS = 10
 
@@ -185,14 +194,20 @@ def generate_scene_image(image_prompt, index):
         f"A cinematic illustration, vertical 9:16 composition, no text or watermarks, "
         f"{STYLE_SUFFIX}: {image_prompt}"
     )
-    client = InferenceClient(provider="hf-inference", api_key=HF_TOKEN)
-    image = client.text_to_image(
-        full_prompt,
-        model=HF_IMAGE_MODEL,
-    )
     img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
-    image.save(img_path)
-    return img_path
+
+    last_err = None
+    for provider in HF_IMAGE_PROVIDERS:
+        try:
+            client = InferenceClient(provider=provider, api_key=HF_TOKEN)
+            image = client.text_to_image(full_prompt, model=HF_IMAGE_MODEL)
+            image.save(img_path)
+            return img_path
+        except Exception as e:
+            last_err = e
+            log(f"    provider '{provider}' failed ({e}), trying next...")
+
+    raise RuntimeError(f"All image providers failed. Last error: {last_err}")
 
 
 def image_to_clip(img_path, index, seconds):
