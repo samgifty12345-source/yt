@@ -5,42 +5,44 @@ import tempfile
 import requests
 import subprocess
 import threading
-import re
-import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-import io
+from googleapiclient.http import MediaFileUpload
 
-WORK_DIR  = tempfile.gettempdir()
-DONE_FILE = "done_pipeline.txt"
+WORK_DIR = tempfile.gettempdir()
+DONE_FILE = "done_history.txt"
 
-GROQ_API_KEY        = os.environ.get("GROQ_API_KEY", "")
-ELEVENLABS_API_KEY  = os.environ.get("ELEVENLABS_API_KEY", "")
+GROQ_API_KEY       = os.environ.get("GROQ_API_KEY", "")
+GEMINI_API_KEY     = os.environ.get("GEMINI_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
 
-COOKIES_PATH = os.path.join(WORK_DIR, "yt_cookies.txt")
+# Edit this anytime in Railway's Variables tab to change the channel's niche.
+# No code changes or redeploy of code needed - just update the variable.
+NICHE_PROMPT = os.environ.get(
+    "NICHE_PROMPT",
+    "Ancient history and forgotten historical events, told dramatically but 100% factually accurate."
+)
 
-YT_COOKIES = os.environ.get("YOUTUBE_COOKIES_TXT", """# Netscape HTTP Cookie File
-.youtube.com	TRUE	/	FALSE	1815339931	SID	g.a000-wiVaauPSgjBbb8z2dcCtThe0EBTTQiI6Qc-0nvVjD3wh45zv6iuCyrlq-NyGgstyOM9PwACgYKAW8SARYSFQHGX2Mi2sbMpuVkCSqGFgDfhW0t4BoVAUF8yKotJqkpYRTEiGqXMr2ARXGt0076
-.youtube.com	TRUE	/	TRUE	1815339931	__Secure-1PSID	g.a000-wiVaauPSgjBbb8z2dcCtThe0EBTTQiI6Qc-0nvVjD3wh45zT2UejOGIkeuCGh6JDgd5VAACgYKAQASARYSFQHGX2MiC6rz4BjpNf6ZvW30ukcXlRoVAUF8yKpZgaZtZ52zldC5xAYbj2oD0076
-.youtube.com	TRUE	/	TRUE	1815339931	SAPISID	t3k8cNGc-g02OGHr/AVACVAUhF0z83og2Q
-.youtube.com	TRUE	/	TRUE	1810559899	LOGIN_INFO	AFmmF2swRAIge0gH08i3OiSk5Lx99mbckfZielz-6FORMK7LJ9GmHJMCIBRJYueJg-NIy48J0g_ph4990pFKnDtltjMClocNKU_i:QUQ3MjNmekdGNUE1Qms2Rk90U3VXN3psMktiZlNfbk9kY0pPLWNxajNOZzJmMWJ6NDBVYi1pbmkya3FDeWM2dHJRZW9XZnNaOHlreFFaSUhJdWtoaW8tRlZXeGJrT0VwTWlzcjFUNDNCSnhLZzBtY2hUUWNFSnV6ZFJoRzlwbEI2N2hmWDc3V0FHc1dPelJEaW5wek1sZ1BMQ3R3UnlWMm5GWldqa3ppVVJQZHhlRllPamZfTDVKTzd3UEZWR2Rxa3ZNenJLejNHc3ZpYzRzMHlsS0s2VHBLVFVURmpHQUZwQQ==
-""")
+# A link to an image of your cartoon style, used to keep every scene visually consistent.
+REFERENCE_IMAGE_URL = os.environ.get("REFERENCE_IMAGE_URL", "")
 
-with open(COOKIES_PATH, "w") as f:
-    f.write(YT_COOKIES)
+# How often the bot generates + posts a video on its own, fully unattended.
+AUTOPILOT_INTERVAL_HOURS = float(os.environ.get("AUTOPILOT_INTERVAL_HOURS", "24"))
 
-pipeline_log = ["Pipeline ready... Waiting for a YouTube or Google Drive link."]
+NUM_SCENES = 6          # 6 scenes x 10s = 60s video
+SCENE_SECONDS = 10
+
+pipeline_log = ["History bot ready. Waiting for first autopilot run or manual trigger."]
 lock = threading.Lock()
 
 HTML = """<!DOCTYPE html>
 <html>
 <head>
-  <title>AI Clip Pipeline</title>
+  <title>AI History Shorts Bot</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -48,23 +50,21 @@ HTML = """<!DOCTYPE html>
     h1 {{ color: #ff0000; margin-bottom: 20px; }}
     .card {{ background: #1a1a1a; border-radius: 12px; padding: 24px; max-width: 600px; }}
     .status {{ padding: 12px; background: #2a2a2a; border-radius: 8px; font-size: 14px; color: #aaa; margin-bottom: 16px; }}
-    .log {{ background: #111; border-radius: 8px; padding: 16px; font-size: 12px; color: #0f0; font-family: monospace; max-height: 300px; overflow-y: auto; margin-bottom: 16px; }}
-    input {{ width: 100%; padding: 12px; background: #2a2a2a; border: 1px solid #444; border-radius: 8px; color: #fff; font-size: 14px; margin-bottom: 12px; }}
+    .log {{ background: #111; border-radius: 8px; padding: 16px; font-size: 12px; color: #0f0; font-family: monospace; max-height: 400px; overflow-y: auto; margin-bottom: 16px; white-space: pre-wrap; }}
     button {{ background: #ff0000; color: #fff; border: none; padding: 12px 28px; border-radius: 8px; font-size: 16px; cursor: pointer; }}
     button:hover {{ background: #cc0000; }}
-    .hint {{ color: #666; font-size: 12px; margin-bottom: 12px; }}
+    .niche {{ color: #888; font-size: 13px; margin-bottom: 16px; }}
   </style>
 </head>
 <body>
-  <h1>🤖 AI Clip Pipeline</h1>
+  <h1>AI History Shorts Bot</h1>
   <div class="card">
-    <div class="status">✅ Posted: <b>{done_count}</b></div>
+    <div class="status">Posted: <b>{done_count}</b> | Autopilot every <b>{interval}h</b></div>
+    <div class="niche">Niche: {niche}</div>
     <h3 style="color:#aaa;font-size:14px;margin-bottom:10px;">PIPELINE STATUS</h3>
     <div class="log">{log_content}</div>
     <form method="POST" action="/trigger">
-      <input name="url" placeholder="YouTube link OR Google Drive link..." required>
-      <p class="hint">Drive: share video → copy link → paste here</p>
-      <button type="submit">▶️ Generate & Post Short</button>
+      <button type="submit">Generate & Post Now</button>
     </form>
   </div>
 </body>
@@ -72,10 +72,11 @@ HTML = """<!DOCTYPE html>
 
 
 def log(msg):
-    print(msg)
-    pipeline_log.append(msg)
-    if len(pipeline_log) > 60:
-        pipeline_log.pop(0)
+    print(msg, flush=True)
+    with lock:
+        pipeline_log.append(msg)
+        if len(pipeline_log) > 80:
+            pipeline_log.pop(0)
 
 
 def get_google_creds(scopes):
@@ -95,22 +96,21 @@ class Handler(BaseHTTPRequestHandler):
         if os.path.exists(DONE_FILE):
             with open(DONE_FILE) as f:
                 done_count = len([l for l in f if l.strip()])
-        log_html = "<br>".join(pipeline_log[-30:])
-        html = HTML.format(done_count=done_count, log_content=log_html)
+        with lock:
+            log_html = "\n".join(pipeline_log[-40:])
+        html = HTML.format(
+            done_count=done_count,
+            interval=AUTOPILOT_INTERVAL_HOURS,
+            niche=NICHE_PROMPT,
+            log_content=log_html,
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
         self.wfile.write(html.encode())
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode()
-        url = ""
-        for part in body.split("&"):
-            if part.startswith("url="):
-                url = requests.utils.unquote(part[4:]).strip()
-        if url:
-            threading.Thread(target=run_pipeline, args=(url,), daemon=True).start()
+        threading.Thread(target=run_pipeline, daemon=True).start()
         self.send_response(303)
         self.send_header("Location", "/")
         self.end_headers()
@@ -124,301 +124,161 @@ def start_server():
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 
-def is_drive_link(url):
-    return "drive.google.com" in url or "docs.google.com" in url
+def groq_chat(prompt, temperature=0.8, max_tokens=1200):
+    res = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+        timeout=60,
+    )
+    res.raise_for_status()
+    return res.json()["choices"][0]["message"]["content"].strip()
 
 
-def extract_drive_file_id(url):
-    """Extract file ID from various Drive URL formats."""
-    patterns = [
-        r"/file/d/([a-zA-Z0-9_-]+)",
-        r"id=([a-zA-Z0-9_-]+)",
-        r"/d/([a-zA-Z0-9_-]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, url)
-        if m:
-            return m.group(1)
-    return None
+def generate_story():
+    log("Picking a topic and writing a factual script...")
+    prompt = f"""You are a history channel scriptwriter. Your channel's niche: {NICHE_PROMPT}
 
+Pick ONE specific, genuinely interesting REAL historical topic or event within that niche.
+Every fact you include must be historically accurate - do not invent or exaggerate details.
+Write a punchy, cinematic ~130-150 word narration script about it, split into exactly {NUM_SCENES} scenes
+of roughly equal length (about {SCENE_SECONDS} seconds of spoken narration each).
 
-def download_from_drive(url):
-    """Download video from Google Drive using OAuth credentials."""
-    log("📥 Detected Google Drive link — downloading via Drive API...")
-    video_path = os.path.join(WORK_DIR, "source_video.mp4")
+For each scene also write a short visual description (image_prompt) of what should be drawn to
+illustrate that part of the narration - concrete, vivid, specific (people, setting, action).
 
-    file_id = extract_drive_file_id(url)
-    if not file_id:
-        log("  ❌ Could not extract file ID from Drive URL")
-        return None
-
-    log(f"  📂 File ID: {file_id}")
-
-    try:
-        creds = get_google_creds([
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/youtube.upload",
-        ])
-        creds.refresh(Request())
-        drive = build("drive", "v3", credentials=creds)
-
-        # Get file metadata
-        meta = drive.files().get(fileId=file_id, fields="name,size,mimeType").execute()
-        log(f"  📄 File: {meta.get('name')} ({int(meta.get('size', 0)) // 1024 // 1024}MB)")
-
-        # Download
-        request = drive.files().get_media(fileId=file_id)
-        with open(video_path, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request, chunksize=10 * 1024 * 1024)
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-                if status:
-                    log(f"  ⬇️ {int(status.progress() * 100)}%")
-
-        log("  ✅ Drive video downloaded")
-        return video_path
-
-    except Exception as e:
-        log(f"  ❌ Drive download failed: {e}")
-        return None
-
-
-def download_from_youtube(url):
-    """Try to download from YouTube (may fail on cloud IPs)."""
-    log("📥 Downloading from YouTube...")
-    video_path = os.path.join(WORK_DIR, "source_video.mp4")
-
-    # Update yt-dlp to nightly
-    try:
-        subprocess.run(
-            ["pip", "install", "yt-dlp", "--pre", "--upgrade", "--break-system-packages", "-q"],
-            capture_output=True, timeout=120
-        )
-        ver = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True).stdout.strip()
-        log(f"  yt-dlp → {ver}")
-    except Exception as e:
-        log(f"  ⚠️ yt-dlp upgrade skipped: {e}")
-
-    fmt = "best"
-    PROXY = "http://snslvrdh:r6ogicxc471x@38.154.203.95:5863"
-
-    attempts = [
-        ("web+cookies", ["--cookies", COOKIES_PATH, "--extractor-args", "youtube:player_client=web", "--no-check-certificates", "--no-cache-dir"]),
-        ("web+cookies+proxy", ["--cookies", COOKIES_PATH, "--extractor-args", "youtube:player_client=web", "--proxy", PROXY, "--no-check-certificates", "--no-cache-dir"]),
-        ("ios (no proxy)", ["--extractor-args", "youtube:player_client=ios", "--no-check-certificates", "--no-cache-dir"]),
-        ("ios+proxy", ["--extractor-args", "youtube:player_client=ios", "--proxy", PROXY, "--no-check-certificates", "--no-cache-dir"]),
-    ]
-
-    # Captions
-    try:
-        cap_cmd = ["yt-dlp", "--cookies", COOKIES_PATH, "--extractor-args", "youtube:player_client=web",
-                   "--no-check-certificates", "--no-cache-dir",
-                   "--write-auto-sub", "--sub-lang", "en", "--sub-format", "json3",
-                   "--skip-download", "-o", os.path.join(WORK_DIR, "captions"), url]
-        subprocess.run(cap_cmd, capture_output=True, timeout=60)
-    except Exception:
-        pass
-
-    for label, flags in attempts:
-        log(f"  🔄 Trying: {label}...")
-        cmd = ["yt-dlp"] + flags + ["-f", fmt, "--merge-output-format", "mp4", "-o", video_path, url]
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=300, text=True)
-            if result.returncode == 0 and os.path.exists(video_path):
-                log(f"  ✅ Downloaded ({label})")
-                return video_path
-            err = result.stderr[-150:].replace("\n", " ")
-            log(f"  ⚠️ Failed: ...{err}")
-        except subprocess.TimeoutExpired:
-            log(f"  ⚠️ Timeout ({label})")
-        except Exception as e:
-            log(f"  ⚠️ Error ({label}): {e}")
-
-    log("  ❌ All YouTube attempts failed")
-    log("  💡 TIP: Upload the video to Google Drive and paste that link instead")
-    return None
-
-
-def download_video_and_captions(url):
-    if is_drive_link(url):
-        return download_from_drive(url), True   # (path, is_drive)
-    else:
-        return download_from_youtube(url), False
-
-
-def parse_captions():
-    files = (glob.glob(os.path.join(WORK_DIR, "captions*.json3")) +
-             glob.glob(os.path.join(WORK_DIR, "captions*.vtt")))
-    if not files:
-        return []
-    cap_file = files[0]
-    log(f"  📄 Parsing captions: {os.path.basename(cap_file)}")
-    segments = []
-    if cap_file.endswith(".json3"):
-        try:
-            with open(cap_file) as f:
-                data = json.load(f)
-            for event in data.get("events", []):
-                if "segs" not in event:
-                    continue
-                start = event.get("tStartMs", 0) / 1000
-                dur = event.get("dDurationMs", 2000) / 1000
-                text = "".join(s.get("utf8", "") for s in event["segs"]).strip()
-                if text and text != "\n":
-                    segments.append({"start": start, "end": start + dur, "text": text})
-        except Exception as e:
-            log(f"  ⚠️ Caption parse error: {e}")
-    elif cap_file.endswith(".vtt"):
-        try:
-            with open(cap_file) as f:
-                content = f.read()
-            for m in re.finditer(r'(\d+:\d+:\d+\.\d+) --> (\d+:\d+:\d+\.\d+).*?\n(.*?)(?=\n\n|\Z)', content, re.DOTALL):
-                def ts(t):
-                    parts = t.replace(",", ".").split(":")
-                    return sum(float(x) * 60**i for i, x in enumerate(reversed(parts)))
-                text = re.sub(r'<[^>]+>', '', m.group(3)).strip()
-                if text:
-                    segments.append({"start": ts(m.group(1)), "end": ts(m.group(2)), "text": text})
-        except Exception as e:
-            log(f"  ⚠️ VTT parse error: {e}")
-    log(f"  ✅ {len(segments)} caption segments")
-    return segments
-
-
-def find_best_clip(segments):
-    log("🧠 Finding best 60-second moment...")
-    if not segments:
-        log("  ⚠️ No captions — using first 60s")
-        return 0, 60, {"hook": "You won't believe this...", "title": "Incredible Moment", "description": "Watch this amazing clip."}
-
-    transcript = "\n".join(f"[{s['start']:.1f}s] {s['text']}" for s in segments[:300])
-    prompt = f"""You are a YouTube Shorts editor. Find the most engaging 60-second moment.
-
-TRANSCRIPT:
-{transcript}
-
-Return ONLY valid JSON:
+Return ONLY valid JSON, no markdown fences, in this exact shape:
 {{
-  "start_seconds": <number>,
-  "end_seconds": <number - exactly 60 seconds after start>,
-  "hook": "one punchy sentence",
-  "title": "viral YouTube title under 60 chars",
-  "description": "2-3 sentence description"
+  "title": "viral YouTube title under 60 chars, no clickbait lies",
+  "description": "2-3 sentence accurate description",
+  "scenes": [
+    {{"narration": "...", "image_prompt": "..."}},
+    ... exactly {NUM_SCENES} of these ...
+  ]
 }}"""
-    try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7},
-            timeout=30
-        )
-        res.raise_for_status()
-        text = res.json()["choices"][0]["message"]["content"].strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
-        start, end = float(data["start_seconds"]), float(data["end_seconds"])
-        log(f"  ✅ {start:.0f}s - {end:.0f}s | {data.get('hook', '')}")
-        return start, end, data
-    except Exception as e:
-        log(f"  ⚠️ AI failed ({e}) — using first 60s")
-        return 0, 60, {"hook": "You won't believe this...", "title": "Incredible Moment", "description": "Watch this amazing clip."}
+    raw = groq_chat(prompt)
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    if len(data.get("scenes", [])) != NUM_SCENES:
+        raise ValueError(f"Expected {NUM_SCENES} scenes, got {len(data.get('scenes', []))}")
+    log(f"  Topic: {data['title']}")
+    return data
 
 
-def clip_video(video_path, start, end):
-    log(f"✂️ Clipping {start:.0f}s–{end:.0f}s and reformatting to 9:16...")
-    clip_path = os.path.join(WORK_DIR, "clip.mp4")
+def generate_scene_image(image_prompt, index):
+    log(f"  Generating image {index + 1}/{NUM_SCENES}...")
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    parts = []
+
+    if REFERENCE_IMAGE_URL:
+        try:
+            ref_bytes = requests.get(REFERENCE_IMAGE_URL, timeout=30).content
+            parts.append(types.Part.from_bytes(data=ref_bytes, mime_type="image/png"))
+        except Exception as e:
+            log(f"    Could not fetch reference image: {e}")
+
+    full_prompt = (
+        f"In the exact same cartoon art style as the reference image provided, draw: {image_prompt}. "
+        f"Vertical 9:16 composition, no text, no watermarks, no captions."
+        if REFERENCE_IMAGE_URL else
+        f"A cinematic cartoon illustration, vertical 9:16 composition, no text or watermarks: {image_prompt}"
+    )
+    parts.append(full_prompt)
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=parts,
+    )
+    for part in response.candidates[0].content.parts:
+        if part.inline_data:
+            img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
+            with open(img_path, "wb") as f:
+                f.write(part.inline_data.data)
+            return img_path
+    raise RuntimeError("No image returned")
+
+
+def image_to_clip(img_path, index, seconds):
+    clip_path = os.path.join(WORK_DIR, f"clip_{index}.mp4")
+    frames = int(25 * seconds)
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start), "-i", video_path, "-t", str(end - start),
-        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1", "-c:a", "aac",
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-        clip_path
+        "ffmpeg", "-y", "-loop", "1", "-i", img_path,
+        "-vf", f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+               f"zoompan=z='min(zoom+0.0018,1.4)':d={frames}:s=1080x1920:fps=25",
+        "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
+        "-pix_fmt", "yuv420p", clip_path,
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=180)
-        log("  ✅ Clip created")
-        return clip_path
-    except Exception as e:
-        log(f"  ❌ Clip failed: {e}")
-        return None
+    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+    return clip_path
 
 
-def generate_commentary(hook, segments, start, end):
-    log("📝 Generating commentary...")
-    window_text = " ".join(s["text"] for s in segments if start <= s["start"] <= end)
-    prompt = f"""Punchy 15-second spoken commentary for a YouTube Short.
-About: {hook}
-Content: {window_text[:500]}
-Rules: max 40 words, hook opener, excited tone, cliffhanger ending, no hashtags/emojis.
-Return ONLY the script."""
-    try:
-        res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.9},
-            timeout=30
-        )
-        res.raise_for_status()
-        script = res.json()["choices"][0]["message"]["content"].strip()
-        log(f"  ✅ Script ready")
-        return script
-    except Exception as e:
-        log(f"  ⚠️ Commentary failed: {e}")
-        return hook
+def concat_clips(clip_paths):
+    log("Stitching scenes together...")
+    list_path = os.path.join(WORK_DIR, "concat_list.txt")
+    with open(list_path, "w") as f:
+        for p in clip_paths:
+            f.write(f"file '{p}'\n")
+    combined_path = os.path.join(WORK_DIR, "combined.mp4")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", combined_path]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+    return combined_path
 
 
-def generate_voiceover(script):
-    log("🎙️ Generating voiceover...")
+def generate_narration(full_script):
+    log("Generating narration voiceover...")
     if not ELEVENLABS_API_KEY:
-        log("  ⚠️ No ElevenLabs key — skipping")
+        log("  No ElevenLabs key - video will have no narration")
         return None
     try:
         res = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
             headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json={"text": script, "model_id": "eleven_monolingual_v1", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
-            timeout=60
+            json={"text": full_script, "model_id": "eleven_monolingual_v1",
+                  "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}},
+            timeout=60,
         )
         if res.status_code == 200:
-            audio_path = os.path.join(WORK_DIR, "commentary.mp3")
+            audio_path = os.path.join(WORK_DIR, "narration.mp3")
             with open(audio_path, "wb") as f:
                 f.write(res.content)
-            log("  ✅ Voiceover generated")
             return audio_path
-        log(f"  ❌ ElevenLabs {res.status_code}")
+        log(f"  ElevenLabs error {res.status_code}: {res.text[:200]}")
         return None
     except Exception as e:
-        log(f"  ❌ Voiceover failed: {e}")
+        log(f"  Narration failed: {e}")
         return None
 
 
-def mix_audio(clip_path, voiceover_path, output_path):
-    log("🎚️ Mixing audio...")
-    if not voiceover_path:
-        cmd = ["ffmpeg", "-y", "-i", clip_path, "-c", "copy", output_path]
+def mux_narration(video_path, audio_path, output_path):
+    log("Adding narration to video...")
+    if not audio_path:
+        cmd = ["ffmpeg", "-y", "-i", video_path, "-c", "copy", output_path]
     else:
         cmd = [
-            "ffmpeg", "-y", "-i", clip_path, "-i", voiceover_path,
-            "-filter_complex", "[0:a]volume=0.2[a1];[1:a]volume=1.0[a2];[a1][a2]amix=inputs=2:duration=first[aout]",
-            "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-c:a", "aac", "-shortest", output_path
+            "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-shortest", output_path,
         ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=180)
-        log("  ✅ Mixed")
-        return output_path
-    except Exception as e:
-        log(f"  ❌ Mix failed: {e}")
-        return clip_path
+    subprocess.run(cmd, check=True, capture_output=True, timeout=90)
+    return output_path
 
 
 def upload_to_youtube(file_path, title, description):
-    log("📤 Uploading Short to YouTube...")
+    log("Uploading to YouTube...")
     try:
         creds = get_google_creds(["https://www.googleapis.com/auth/youtube.upload"])
         creds.refresh(Request())
         youtube = build("youtube", "v3", credentials=creds)
         body = {
-            "snippet": {"title": title[:100], "description": f"{description}\n\n#shorts #viral #fyp", "categoryId": "22"},
+            "snippet": {"title": title[:100], "description": f"{description}\n\n#shorts #history",
+                        "categoryId": "27"},
             "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
         }
         media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
@@ -426,65 +286,61 @@ def upload_to_youtube(file_path, title, description):
         response = None
         while response is None:
             status, response = req.next_chunk()
-            if status:
-                log(f"  ⬆️ {int(status.progress()*100)}%")
         vid = response.get("id")
-        log(f"  ✅ Live → https://youtube.com/watch?v={vid}")
+        log(f"  Live -> https://youtube.com/watch?v={vid}")
         return vid
     except Exception as e:
-        log(f"  ❌ Upload failed: {e}")
+        log(f"  Upload failed: {e}")
         return None
 
 
-def run_pipeline(url):
-    log(f"\n🚀 Starting pipeline for: {url}")
+def run_pipeline():
+    log("\nStarting new history short...")
+    try:
+        story = generate_story()
+        full_narration = " ".join(s["narration"] for s in story["scenes"])
 
-    result = download_video_and_captions(url)
-    video_path, is_drive = result
+        clip_paths = []
+        for i, scene in enumerate(story["scenes"]):
+            img_path = generate_scene_image(scene["image_prompt"], i)
+            clip_path = image_to_clip(img_path, i, SCENE_SECONDS)
+            clip_paths.append(clip_path)
 
-    if not video_path:
-        log("❌ Aborted: could not get video")
-        return
+        combined = concat_clips(clip_paths)
+        narration_path = generate_narration(full_narration)
+        final_path = os.path.join(WORK_DIR, "final_history.mp4")
+        mux_narration(combined, narration_path, final_path)
 
-    segments = parse_captions() if not is_drive else []
-    if is_drive:
-        log("  ℹ️ Drive video — no captions, using first 60s")
+        vid = upload_to_youtube(final_path, story["title"], story["description"])
+        if vid:
+            with open(DONE_FILE, "a") as f:
+                f.write(f"{time.time()} | {story['title']}\n")
+            log("Pipeline complete!")
+        else:
+            log("Upload failed - pipeline stopped")
 
-    start, end, clip_data = find_best_clip(segments)
-    hook        = clip_data.get("hook", "You won't believe this...") if isinstance(clip_data, dict) else str(clip_data)
-    title       = clip_data.get("title", "Incredible Moment") if isinstance(clip_data, dict) else "Incredible Moment"
-    description = clip_data.get("description", "Watch this.") if isinstance(clip_data, dict) else "Watch this."
+        for p in clip_paths + [combined, narration_path, final_path]:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
-    clip_path = clip_video(video_path, start, end)
-    if not clip_path:
-        log("❌ Aborted: clip failed")
-        return
+    except Exception as e:
+        log(f"Pipeline error: {e}")
 
-    script = generate_commentary(hook, segments, start, end)
-    voiceover_path = generate_voiceover(script)
 
-    final_path = os.path.join(WORK_DIR, "final_short.mp4")
-    mix_audio(clip_path, voiceover_path, final_path)
-
-    vid = upload_to_youtube(final_path, title, description)
-    if vid:
-        with open(DONE_FILE, "a") as f:
-            f.write(f"{time.time()} | {title}\n")
-        log("✅ Pipeline complete!")
-    else:
-        log("❌ Upload failed")
-
-    for path in [video_path, clip_path, voiceover_path, final_path]:
-        try:
-            if path and os.path.exists(path):
-                os.remove(path)
-        except:
-            pass
+def autopilot_loop():
+    while True:
+        run_pipeline()
+        log(f"Sleeping {AUTOPILOT_INTERVAL_HOURS}h until next autopilot run...")
+        time.sleep(AUTOPILOT_INTERVAL_HOURS * 3600)
 
 
 def main():
     threading.Thread(target=start_server, daemon=True).start()
-    log("🤖 Bot started. Paste a YouTube or Google Drive link to begin.")
+    threading.Thread(target=autopilot_loop, daemon=True).start()
+    log("Bot started. First autopilot run begins immediately, then repeats on schedule.")
     while True:
         time.sleep(60)
 
