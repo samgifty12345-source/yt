@@ -17,6 +17,7 @@ from huggingface_hub import InferenceClient
 
 WORK_DIR = tempfile.gettempdir()
 DONE_FILE = "done_history.txt"
+REFERENCE_IMAGE_PATH_FILE = "reference_image_path.txt"  # persists chosen ref image across restarts
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
@@ -25,6 +26,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # used if all HF providers fail. Uses Stable Image Core (cheap, 3 credits/gen).
 STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY", "")
 STABILITY_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/generate/core"
+STABILITY_STYLE_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/control/style"
 
 # Fish Audio TTS (https://docs.fish.audio) - primary narration voice.
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY", "")
@@ -64,6 +66,11 @@ POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 BACKGROUND_MUSIC_URL = os.environ.get("BACKGROUND_MUSIC_URL", "")
 BACKGROUND_MUSIC_VOLUME = float(os.environ.get("BACKGROUND_MUSIC_VOLUME", "0.42"))
 
+# How strongly generated scenes should match the reference image's style
+# (0 = ignore reference, 1 = match it very closely). 0.5 is a good default:
+# strong enough for a consistent look, loose enough to still vary per scene.
+STYLE_FIDELITY = float(os.environ.get("STYLE_FIDELITY", "0.5"))
+
 SCENE_SECONDS = 10  # each scene/image is on screen this long
 
 # Orientation presets: (width, height, description used in prompts)
@@ -87,7 +94,15 @@ CONFIG = {
     "topic": DEFAULT_NICHE,
     "duration_seconds": 60,
     "orientation": "shorts",
+    "reference_image_path": None,  # user-uploaded character/style reference, or None
 }
+
+# Load a persisted reference image path (if the process restarted) so uploads survive reboots.
+if os.path.exists(REFERENCE_IMAGE_PATH_FILE):
+    with open(REFERENCE_IMAGE_PATH_FILE) as f:
+        _saved_ref = f.read().strip()
+    if _saved_ref and os.path.exists(_saved_ref):
+        CONFIG["reference_image_path"] = _saved_ref
 
 
 def log(msg):
@@ -214,6 +229,21 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   .hint { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
   footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 26px; }
+  .refbox {
+    display: flex; align-items: center; gap: 12px; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-top: 6px;
+  }
+  .refbox img {
+    width: 54px; height: 54px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border);
+  }
+  .refbox .refstate { font-size: 12.5px; color: var(--muted); flex: 1; }
+  .refbox .refstate b { color: var(--text); }
+  input[type=file] {
+    width: 100%; background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px; color: var(--muted); font-size: 12.5px;
+  }
+  .checkline { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+  .checkline input { width: auto; }
 </style>
 </head>
 <body>
@@ -243,7 +273,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
     <div class="card">
       <h2>Configure Next Video</h2>
-      <form method="POST" action="/configure">
+      <form method="POST" action="/configure" enctype="multipart/form-data">
         <label>Topic / niche</label>
         <textarea name="topic" rows="3" placeholder="e.g. The Bronze Age Collapse">@@TOPIC@@</textarea>
 
@@ -261,11 +291,28 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
           <span class="sub">minutes (~@@SCENE_COUNT@@ scenes)</span>
         </div>
 
+        <label>Character / style reference image (optional)</label>
+        <div class="refbox">
+          @@REF_THUMB@@
+          <div class="refstate">@@REF_STATE@@</div>
+        </div>
+        <input type="file" name="reference_image" accept="image/*">
+        <div class="checkline">
+          <input type="checkbox" id="remove_ref" name="remove_reference" value="1">
+          <label for="remove_ref" style="margin:0;">Remove current reference image</label>
+        </div>
+
         <button type="submit" class="secondary">Save Settings</button>
       </form>
       <div class="hint">
         Shorts are capped at 3 min, long-form at 10 min. Settings persist until you change them again,
         and apply to both manual and autopilot runs.
+        <br><br>
+        The reference image is used to keep the art style (and, loosely, a recurring character's look)
+        consistent across scenes. If you don't upload one, the bot auto-generates the first scene, then
+        uses that as the style reference for the rest of the video - so scenes still stay visually
+        consistent with each other, just not pinned to a specific look you chose. Requires a Stability
+        API key; without one, only the text prompts help keep things consistent.
       </div>
     </div>
   </div>
@@ -303,6 +350,14 @@ def render_page():
     duration_minutes = round(cfg["duration_seconds"] / 60, 2)
     scene_count = max(1, round(cfg["duration_seconds"] / SCENE_SECONDS))
 
+    ref_path = cfg.get("reference_image_path")
+    if ref_path and os.path.exists(ref_path):
+        ref_state = "<b>Set</b> - used as the style/character reference for every scene."
+        ref_thumb = '<img src="/reference_image" alt="reference">'
+    else:
+        ref_state = "None set - first generated scene becomes the auto-reference (if Stability key is configured)."
+        ref_thumb = '<img src="" style="visibility:hidden">'
+
     html = PAGE_TEMPLATE
     html = html.replace("@@DONE_COUNT@@", str(done_count))
     html = html.replace("@@INTERVAL@@", str(AUTOPILOT_INTERVAL_HOURS))
@@ -316,6 +371,8 @@ def render_page():
     html = html.replace("@@SCENE_COUNT@@", str(scene_count))
     html = html.replace("@@STARTUP_WAIT@@", str(STARTUP_WAIT_HOURS))
     html = html.replace("@@NEXT_RUN_IN@@", format_countdown(next_run_at[0]))
+    html = html.replace("@@REF_THUMB@@", ref_thumb)
+    html = html.replace("@@REF_STATE@@", ref_state)
     return html
 
 
@@ -325,8 +382,68 @@ def parse_post_body(handler):
     return {k: v[0] for k, v in urllib.parse.parse_qs(body).items()}
 
 
+def parse_multipart(handler):
+    """Minimal multipart/form-data parser (no external deps; cgi is removed in 3.13+).
+    Returns (fields: dict[str,str], files: dict[str, {"filename": str, "data": bytes}])."""
+    content_type = handler.headers.get("Content-Type", "")
+    if "boundary=" not in content_type:
+        return {}, {}
+    boundary = content_type.split("boundary=", 1)[1].strip()
+    if boundary.startswith('"') and boundary.endswith('"'):
+        boundary = boundary[1:-1]
+    boundary_bytes = ("--" + boundary).encode()
+
+    length = int(handler.headers.get("Content-Length", 0))
+    raw = handler.rfile.read(length) if length else b""
+
+    fields, files = {}, {}
+    parts = raw.split(boundary_bytes)
+    for part in parts:
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if b"\r\n\r\n" not in part:
+            continue
+        headers_blob, content = part.split(b"\r\n\r\n", 1)
+        content = content.rstrip(b"\r\n")
+        headers_text = headers_blob.decode(errors="ignore")
+        disp_line = next((h for h in headers_text.split("\r\n") if h.lower().startswith("content-disposition")), "")
+        name = None
+        filename = None
+        for piece in disp_line.split(";"):
+            piece = piece.strip()
+            if piece.startswith("name="):
+                name = piece.split("=", 1)[1].strip('"')
+            elif piece.startswith("filename="):
+                filename = piece.split("=", 1)[1].strip('"')
+        if name is None:
+            continue
+        if filename is not None:
+            if filename:  # empty filename => no file chosen
+                files[name] = {"filename": filename, "data": content}
+        else:
+            fields[name] = content.decode(errors="ignore")
+    return fields, files
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/reference_image":
+            cfg = get_config()
+            ref_path = cfg.get("reference_image_path")
+            if ref_path and os.path.exists(ref_path):
+                with open(ref_path, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
         html = render_page()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -337,7 +454,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/configure":
-            fields = parse_post_body(self)
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.startswith("multipart/form-data"):
+                fields, files = parse_multipart(self)
+            else:
+                fields, files = parse_post_body(self), {}
+
             with config_lock:
                 if fields.get("topic", "").strip():
                     CONFIG["topic"] = fields["topic"].strip()
@@ -353,6 +475,32 @@ class Handler(BaseHTTPRequestHandler):
                 cap = ORIENTATIONS[orientation]["max_seconds"]
                 seconds = max(SCENE_SECONDS, min(seconds, cap))
                 CONFIG["duration_seconds"] = seconds
+
+                if fields.get("remove_reference") == "1":
+                    old = CONFIG.get("reference_image_path")
+                    if old and os.path.exists(old):
+                        try:
+                            os.remove(old)
+                        except Exception:
+                            pass
+                    CONFIG["reference_image_path"] = None
+                    if os.path.exists(REFERENCE_IMAGE_PATH_FILE):
+                        os.remove(REFERENCE_IMAGE_PATH_FILE)
+                    log("Reference image removed.")
+
+                ref_file = files.get("reference_image")
+                if ref_file and ref_file.get("data"):
+                    ext = os.path.splitext(ref_file["filename"])[1].lower() or ".png"
+                    if ext not in (".png", ".jpg", ".jpeg", ".webp"):
+                        ext = ".png"
+                    ref_path = os.path.join(WORK_DIR, f"user_reference{ext}")
+                    with open(ref_path, "wb") as f:
+                        f.write(ref_file["data"])
+                    CONFIG["reference_image_path"] = ref_path
+                    with open(REFERENCE_IMAGE_PATH_FILE, "w") as f:
+                        f.write(ref_path)
+                    log(f"Reference image uploaded ({ref_file['filename']}) - will be used for style/character consistency.")
+
             log(f"Settings updated -> orientation={orientation}, "
                 f"duration={seconds/60:.2f}min, topic='{CONFIG['topic'][:60]}'")
         elif self.path == "/trigger":
@@ -404,8 +552,15 @@ Write a punchy, cinematic narration script about it, split into exactly {num_sce
 of roughly equal length (about {SCENE_SECONDS} seconds of spoken narration each, so aim for
 roughly {int(total_seconds * 2.3)} words total across all scenes combined).
 
+If the same named person or persons recur across multiple scenes, first invent a short, fixed
+physical-description tag for each of them (age, hair, face shape, clothing colors/style, any
+distinguishing features) and reuse that EXACT phrase, word-for-word, inside the image_prompt of
+every single scene that person appears in. This is critical for keeping their look consistent
+across images - do not vary or paraphrase the description between scenes.
+
 For each scene also write a short visual description (image_prompt) of what should be drawn to
-illustrate that part of the narration - concrete, vivid, specific (people, setting, action).
+illustrate that part of the narration - concrete, vivid, specific (people, setting, action), and
+including the fixed character-description tag(s) above wherever that person appears.
 
 Also return 5-8 relevant hashtags for the video (no # symbol, no spaces, lowercase).
 
@@ -445,8 +600,45 @@ def _try_huggingface_image(full_prompt, img_path):
     return False
 
 
+def _try_stability_style_reference(full_prompt, img_path, orientation, reference_path):
+    """Use Stability AI's style-reference control endpoint to condition a new image
+    on an existing reference image, for style/character consistency. Returns True on success."""
+    if not STABILITY_API_KEY:
+        return False
+    if not reference_path or not os.path.exists(reference_path):
+        return False
+    try:
+        log(f"    trying Stability AI (style reference from {os.path.basename(reference_path)})...")
+        aspect_ratio = ORIENTATIONS[orientation]["stability_ar"]
+        with open(reference_path, "rb") as ref_f:
+            res = requests.post(
+                STABILITY_STYLE_ENDPOINT,
+                headers={
+                    "authorization": f"Bearer {STABILITY_API_KEY}",
+                    "accept": "image/*",
+                },
+                files={"image": ref_f},
+                data={
+                    "prompt": full_prompt,
+                    "aspect_ratio": aspect_ratio,
+                    "fidelity": str(STYLE_FIDELITY),
+                    "output_format": "png",
+                },
+                timeout=60,
+            )
+        if res.status_code == 200:
+            with open(img_path, "wb") as f:
+                f.write(res.content)
+            return True
+        log(f"    Stability AI style-reference error {res.status_code}: {res.text[:300]}")
+        return False
+    except Exception as e:
+        log(f"    Stability AI style-reference failed: {e}")
+        return False
+
+
 def _try_stability_image(full_prompt, img_path, orientation):
-    """Fallback #2: Stability AI Stable Image Core. Returns True on success."""
+    """Fallback #2: Stability AI Stable Image Core (no reference image). Returns True on success."""
     if not STABILITY_API_KEY:
         log("    no STABILITY_API_KEY set - skipping Stability AI fallback")
         return False
@@ -497,7 +689,9 @@ def _try_pollinations_image(full_prompt, img_path, orientation):
         return False
 
 
-def generate_scene_image(image_prompt, index, num_scenes, orientation):
+def generate_scene_image(image_prompt, index, num_scenes, orientation, reference_path=None):
+    """reference_path: either the user-uploaded reference, or an auto-anchor image from
+    scene 0 of this same video, used to keep style/character consistent across scenes."""
     log(f"  Generating image {index + 1}/{num_scenes}...")
     full_prompt = (
         f"A cinematic illustration, {ORIENTATIONS[orientation]['aspect_text']} composition, "
@@ -505,7 +699,12 @@ def generate_scene_image(image_prompt, index, num_scenes, orientation):
     )
     img_path = os.path.join(WORK_DIR, f"scene_{index}.png")
 
-    # Fallback chain: Hugging Face providers -> Stability AI -> Pollinations
+    # If we have a reference image (user-provided or auto-anchor from scene 0), lead with
+    # Stability's style-reference endpoint so this scene matches it.
+    if reference_path and _try_stability_style_reference(full_prompt, img_path, orientation, reference_path):
+        return img_path
+
+    # Fallback chain: Hugging Face providers -> Stability AI (no ref) -> Pollinations
     if _try_huggingface_image(full_prompt, img_path):
         return img_path
 
@@ -685,16 +884,29 @@ def run_pipeline():
 
     log("\nStarting new history video...")
     clip_paths, combined, narration_path, final_path = [], None, None, None
+    auto_anchor_path = None  # scene-0 image, used as a style reference for later scenes
+    # if the user didn't upload one of their own
     try:
         cfg = get_config()
         orientation = cfg["orientation"]
         num_scenes = max(1, round(cfg["duration_seconds"] / SCENE_SECONDS))
+        user_reference = cfg.get("reference_image_path")
+        if user_reference:
+            log("Using your uploaded reference image for style/character consistency.")
 
         story = generate_story(cfg["topic"], num_scenes)
         full_narration = " ".join(s["narration"] for s in story["scenes"])
 
         for i, scene in enumerate(story["scenes"]):
-            img_path = generate_scene_image(scene["image_prompt"], i, num_scenes, orientation)
+            # Reference priority: user-uploaded image > auto-anchor from this video's own scene 0.
+            reference_for_scene = user_reference or auto_anchor_path
+            img_path = generate_scene_image(
+                scene["image_prompt"], i, num_scenes, orientation,
+                reference_path=reference_for_scene,
+            )
+            if i == 0 and not user_reference:
+                auto_anchor_path = img_path
+                log("  Using this first scene as the style anchor for the rest of the video.")
             clip_path = image_to_clip(img_path, i, SCENE_SECONDS, orientation)
             clip_paths.append(clip_path)
 
