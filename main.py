@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import tempfile
 import requests
 import subprocess
@@ -23,10 +24,24 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
 # Stability AI (https://platform.stability.ai) - fallback #2 for image gen,
-# used if all HF providers fail. Uses Stable Image Core (cheap, 3 credits/gen).
+# used if all HF providers fail. Uses SDXL 1.0 - Stability's cheapest model
+# (from ~0.9 credits/gen, vs 3 for Stable Image Core), since credits are tight.
 STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY", "")
-STABILITY_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/generate/core"
+STABILITY_SDXL_ENGINE = os.environ.get("STABILITY_SDXL_ENGINE", "stable-diffusion-xl-1024-v1-0")
+STABILITY_SDXL_ENDPOINT = f"https://api.stability.ai/v1/generation/{STABILITY_SDXL_ENGINE}/text-to-image"
+
+# The style-reference control tool (used to keep a consistent character/style
+# across scenes) is a separate, pricier Stability product from SDXL - there is
+# no "cheap" version of it, so it's left as-is and only kicks in when a
+# reference image is actually available.
 STABILITY_STYLE_ENDPOINT = "https://api.stability.ai/v2beta/stable-image/control/style"
+
+# SDXL 1.0 only accepts a fixed set of width/height pairs. Pick the closest
+# match to each orientation's aspect ratio.
+SDXL_DIMS = {
+    "shorts": (640, 1536),   # closest to 9:16
+    "long":   (1344, 768),   # closest to 16:9
+}
 
 # Fish Audio TTS (https://docs.fish.audio) - primary narration voice.
 FISH_AUDIO_API_KEY = os.environ.get("FISH_AUDIO_API_KEY", "")
@@ -74,7 +89,9 @@ STYLE_FIDELITY = float(os.environ.get("STYLE_FIDELITY", "0.5"))
 SCENE_SECONDS = 10  # each scene/image is on screen this long
 
 # Orientation presets: (width, height, description used in prompts)
-# stability_ar is the closest supported Stability aspect_ratio for that shape.
+# stability_ar is the closest supported Stability aspect_ratio for that shape
+# (used by the style-reference control endpoint, which does support arbitrary
+# aspect ratios - unlike SDXL below).
 ORIENTATIONS = {
     "shorts": {"w": 1080, "h": 1920, "aspect_text": "vertical 9:16", "max_seconds": 180, "stability_ar": "9:16"},
     "long":   {"w": 1920, "h": 1080, "aspect_text": "horizontal 16:9", "max_seconds": 600, "stability_ar": "16:9"},
@@ -602,13 +619,16 @@ def _try_huggingface_image(full_prompt, img_path):
 
 def _try_stability_style_reference(full_prompt, img_path, orientation, reference_path):
     """Use Stability AI's style-reference control endpoint to condition a new image
-    on an existing reference image, for style/character consistency. Returns True on success."""
+    on an existing reference image, for style/character consistency. Returns True on success.
+    Note: this is a separate, pricier Stability product from SDXL - there is no cheap
+    equivalent for style-conditioned generation, so it's only used when a reference
+    image actually exists (uploaded, or auto-anchor from this video's own scene 0)."""
     if not STABILITY_API_KEY:
         return False
     if not reference_path or not os.path.exists(reference_path):
         return False
     try:
-        log(f"    trying Stability AI (style reference from {os.path.basename(reference_path)})...")
+        log(f"    trying Stability AI style-reference (from {os.path.basename(reference_path)})...")
         aspect_ratio = ORIENTATIONS[orientation]["stability_ar"]
         with open(reference_path, "rb") as ref_f:
             res = requests.post(
@@ -638,35 +658,46 @@ def _try_stability_style_reference(full_prompt, img_path, orientation, reference
 
 
 def _try_stability_image(full_prompt, img_path, orientation):
-    """Fallback #2: Stability AI Stable Image Core (no reference image). Returns True on success."""
+    """Fallback #2: SDXL 1.0 - Stability's cheapest model (from ~0.9 credits/gen),
+    used instead of Stable Image Core to stretch a small credit balance as far as
+    possible. No reference-image conditioning here (that's the pricier style
+    endpoint above); this is plain text-to-image. Returns True on success."""
     if not STABILITY_API_KEY:
         log("    no STABILITY_API_KEY set - skipping Stability AI fallback")
         return False
     try:
-        log("    trying Stability AI (Stable Image Core)...")
-        aspect_ratio = ORIENTATIONS[orientation]["stability_ar"]
+        log("    trying Stability AI (SDXL 1.0)...")
+        width, height = SDXL_DIMS[orientation]
         res = requests.post(
-            STABILITY_ENDPOINT,
+            STABILITY_SDXL_ENDPOINT,
             headers={
                 "authorization": f"Bearer {STABILITY_API_KEY}",
-                "accept": "image/*",
+                "content-type": "application/json",
+                "accept": "application/json",
             },
-            files={"none": ""},
-            data={
-                "prompt": full_prompt,
-                "aspect_ratio": aspect_ratio,
-                "output_format": "png",
+            json={
+                "text_prompts": [{"text": full_prompt, "weight": 1}],
+                "cfg_scale": 7,
+                "height": height,
+                "width": width,
+                "samples": 1,
+                "steps": 30,
             },
             timeout=60,
         )
         if res.status_code == 200:
+            artifacts = res.json().get("artifacts", [])
+            if not artifacts:
+                log("    Stability AI (SDXL) returned no image artifacts")
+                return False
+            img_bytes = base64.b64decode(artifacts[0]["base64"])
             with open(img_path, "wb") as f:
-                f.write(res.content)
+                f.write(img_bytes)
             return True
-        log(f"    Stability AI error {res.status_code}: {res.text[:300]}")
+        log(f"    Stability AI (SDXL) error {res.status_code}: {res.text[:300]}")
         return False
     except Exception as e:
-        log(f"    Stability AI failed: {e}")
+        log(f"    Stability AI (SDXL) failed: {e}")
         return False
 
 
@@ -704,7 +735,7 @@ def generate_scene_image(image_prompt, index, num_scenes, orientation, reference
     if reference_path and _try_stability_style_reference(full_prompt, img_path, orientation, reference_path):
         return img_path
 
-    # Fallback chain: Hugging Face providers -> Stability AI (no ref) -> Pollinations
+    # Fallback chain: Hugging Face providers -> Stability AI SDXL (cheapest) -> Pollinations
     if _try_huggingface_image(full_prompt, img_path):
         return img_path
 
