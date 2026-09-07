@@ -542,7 +542,7 @@ def start_server():
 # Content pipeline
 # ---------------------------------------------------------------------------
 
-def groq_chat(prompt, temperature=0.8, max_tokens=1800):
+def groq_chat(prompt, temperature=0.8, max_tokens=3000):
     res = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
@@ -551,11 +551,24 @@ def groq_chat(prompt, temperature=0.8, max_tokens=1800):
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "reasoning_effort": "low",
         },
         timeout=60,
     )
     res.raise_for_status()
-    return res.json()["choices"][0]["message"]["content"].strip()
+    body = res.json()
+    choice = body["choices"][0]
+    content = (choice.get("message", {}).get("content") or "").strip()
+    if not content:
+        # Reasoning models can burn the whole token budget on hidden reasoning
+        # and return empty content, or the API can return a finish_reason
+        # like "length" or "content_filter" instead of real text.
+        finish_reason = choice.get("finish_reason")
+        raise RuntimeError(
+            f"Groq returned empty content (finish_reason={finish_reason}). "
+            f"Full response: {json.dumps(body)[:800]}"
+        )
+    return content
 
 
 def generate_story(topic, num_scenes):
@@ -593,7 +606,10 @@ Return ONLY valid JSON, no markdown fences, in this exact shape:
 }}"""
     raw = groq_chat(prompt)
     raw = raw.replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Groq response wasn't valid JSON: {e}\nRaw content: {raw[:800]}") from e
     if len(data.get("scenes", [])) != num_scenes:
         raise ValueError(f"Expected {num_scenes} scenes, got {len(data.get('scenes', []))}")
     log(f"  Topic: {data['title']}")
