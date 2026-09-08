@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import random
 import base64
 import tempfile
 import requests
@@ -55,7 +56,10 @@ DEFAULT_NICHE = os.environ.get(
 
 STYLE_SUFFIX = os.environ.get(
     "STYLE_SUFFIX",
-    "flat 2D cartoon illustration style, muted earth tones, thick black outlines, consistent character design. only one face should be consistent the rest dorfent because the previius ones where all lookng like the same eprso 5times i=evry face "
+    "flat 2D cartoon illustration style, muted earth tones, thick black outlines. "
+    "Only the named recurring character(s) described in the prompt should keep a consistent "
+    "face/appearance across scenes - every other person shown (background characters, crowds, "
+    "unnamed figures) must have a distinct, varied face and appearance, not reused from other scenes."
 )
 
 # How often autopilot posts once it's running on its own schedule.
@@ -592,6 +596,11 @@ For each scene also write a short visual description (image_prompt) of what shou
 illustrate that part of the narration - concrete, vivid, specific (people, setting, action), and
 including the fixed character-description tag(s) above wherever that person appears.
 
+IMPORTANT: the physical-description tags (hair, clothing, build, etc.) belong ONLY inside
+image_prompt. The "narration" field is spoken voiceover - it must read like natural spoken
+storytelling and must NEVER contain physical-description phrases like "a boy with white hair
+and a blue shirt" or "a tall man". Refer to people in narration by name, title, or role only.
+
 Also return 5-8 relevant hashtags for the video (no # symbol, no spaces, lowercase).
 
 Return ONLY valid JSON, no markdown fences, in this exact shape:
@@ -769,10 +778,33 @@ def image_to_clip(img_path, index, seconds, orientation):
     w, h = dims["w"], dims["h"]
     clip_path = os.path.join(WORK_DIR, f"clip_{index}.mp4")
     frames = int(25 * seconds)
+
+    # Randomize zoom direction (in/out) and pan direction (which way it drifts)
+    # per clip so scenes don't all move the same way.
+    zoom_in = random.choice([True, False])
+    if zoom_in:
+        z_expr = "min(zoom+0.0018,1.4)"
+    else:
+        z_expr = "if(eq(on,0),1.4,max(zoom-0.0018,1.0))"
+
+    pan = random.choice(["left", "right", "up", "down", "center"])
+    if pan == "left":
+        x_expr, y_expr = "(iw-iw/zoom)*(1-on/{f})", "(ih-ih/zoom)/2"
+    elif pan == "right":
+        x_expr, y_expr = "(iw-iw/zoom)*on/{f}", "(ih-ih/zoom)/2"
+    elif pan == "up":
+        x_expr, y_expr = "(iw-iw/zoom)/2", "(ih-ih/zoom)*(1-on/{f})"
+    elif pan == "down":
+        x_expr, y_expr = "(iw-iw/zoom)/2", "(ih-ih/zoom)*on/{f}"
+    else:
+        x_expr, y_expr = "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
+    x_expr = x_expr.format(f=frames)
+    y_expr = y_expr.format(f=frames)
+
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", img_path,
         "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
-               f"zoompan=z='min(zoom+0.0018,1.4)':d={frames}:s={w}x{h}:fps=25",
+               f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d={frames}:s={w}x{h}:fps=25",
         "-t", str(seconds), "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
         "-pix_fmt", "yuv420p", clip_path,
     ]
