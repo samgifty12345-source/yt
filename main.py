@@ -271,7 +271,8 @@ def cookies_path():
 
 
 def ydl_opts(**extra):
-    o = {"quiet": True, "no_warnings": True}
+    o = {"quiet": True, "no_warnings": True,
+         "extractor_args": {"youtubetab": {"skip": ["authcheck"]}}}   # same as --extractor-args youtubetab:skip=authcheck
     cp = cookies_path()
     if cp:
         # yt-dlp rewrites the cookie file, so give it a private copy
