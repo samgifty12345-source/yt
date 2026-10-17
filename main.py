@@ -34,6 +34,11 @@ Env vars:
   FISH_API_KEY        Fish Audio key
   FISH_VOICE_ID       optional, your Fish voice model id (default voice if empty)
   FISH_MODEL          optional, default s2-pro
+  Voice order: Fish Audio -> Gemini voice (free, uses GEMINI_API_KEY) -> free Microsoft voice.
+  The first one that works is used for the whole video.
+  GEMINI_VOICE        optional Gemini voice name (default Kore; others: Puck, Charon, Fenrir, Aoede, Orus...)
+  GEMINI_TTS_MODEL    optional, default gemini-3.1-flash-tts-preview (auto-picks a TTS model if missing)
+  EDGE_VOICE          optional, last-resort free voice (default en-US-GuyNeural)
   CLAUDE_MODEL        optional (only if using Anthropic), default claude-sonnet-5-5
   KREA_MODEL          optional, default krea/krea-2/medium
   STYLE_HINT          optional text added to every image prompt
@@ -92,6 +97,9 @@ KREA_MODEL = os.environ.get("KREA_MODEL", "krea/krea-2/medium")
 FISH_API_KEY = os.environ.get("FISH_API_KEY", "")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID", "")
 FISH_MODEL = os.environ.get("FISH_MODEL", "s2-pro")
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-GuyNeural")
+GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Kore")
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
 STYLE_HINT = os.environ.get("STYLE_HINT", "").strip()
 STYLE_STRENGTH = float(os.environ.get("STYLE_STRENGTH", "0.8"))
 PREVIEW_SECONDS = int(os.environ.get("PREVIEW_SECONDS", "90"))
@@ -272,6 +280,7 @@ def startup_update():
     try:
         update_ytdlp(False)
         pip_install("youtube-transcript-api")
+        pip_install("edge-tts")
     finally:
         ytdlp_ready.set()
 
@@ -813,6 +822,87 @@ def fish_tts(text, dest):
         f.write(r.content)
 
 
+def edge_tts_save(text, dest):
+    """Free Microsoft voice (edge-tts). Used only when Fish Audio has no API credit."""
+    import asyncio
+    try:
+        import edge_tts
+    except ImportError:
+        raise RuntimeError("edge-tts isn't installed (pip install edge-tts)")
+    asyncio.run(edge_tts.Communicate(text, EDGE_VOICE).save(dest))
+    if not os.path.isfile(dest) or os.path.getsize(dest) < 500:
+        raise RuntimeError("edge-tts returned no audio")
+
+
+def pick_tts_model():
+    r = http("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+             headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+    names = sorted(m.get("name", "").split("/")[-1] for m in (r.json().get("models", []) if r.status_code == 200 else [])
+                   if "tts" in m.get("name", "") and "generateContent" in m.get("supportedGenerationMethods", []))
+    return names[-1] if names else None
+
+
+def gemini_tts(text, dest):
+    """Human-sounding voice from Google (free tier of your Gemini key). Returns mp3."""
+    global GEMINI_TTS_MODEL
+    body = {"contents": [{"parts": [{"text": "Say in a calm, engaging narrator voice: " + text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_VOICE}}}}}
+    r = None
+    for _ in range(2):
+        r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent",
+                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                 json=body, timeout=180, tries=6)
+        if r.status_code == 404:
+            m = pick_tts_model()
+            if m and m != GEMINI_TTS_MODEL:
+                GEMINI_TTS_MODEL = m
+                continue
+        break
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini voice {r.status_code}: {r.text[:200]}")
+    parts = ((r.json().get("candidates") or [{}])[0].get("content") or {}).get("parts", [])
+    blob = next((p.get("inlineData") or p.get("inline_data") for p in parts if p.get("inlineData") or p.get("inline_data")), None)
+    if not blob or not blob.get("data"):
+        raise RuntimeError("Gemini voice returned no audio")
+    rate = re.search(r"rate=(\d+)", blob.get("mimeType") or blob.get("mime_type") or "")
+    pcm = dest + ".pcm"
+    with open(pcm, "wb") as f:
+        f.write(base64.b64decode(blob["data"]))
+    try:
+        run_ffmpeg(["ffmpeg", "-y", "-f", "s16le", "-ar", rate.group(1) if rate else "24000", "-ac", "1",
+                    "-i", pcm, "-c:a", "libmp3lame", "-q:a", "3", dest], "convert Gemini voice")
+    finally:
+        try:
+            os.remove(pcm)
+        except OSError:
+            pass
+
+
+def make_voiceovers(texts, audios):
+    """Try the voices in order on the first line; the first that works voices the WHOLE video
+    (so the voice never changes halfway)."""
+    options = []
+    if FISH_API_KEY:
+        options.append(("Fish Audio", fish_tts, WORKERS))
+    if GEMINI_API_KEY:
+        options.append(("Gemini voice (free)", gemini_tts, 2))
+    options.append(("free Microsoft voice", edge_tts_save, WORKERS))
+    for k, (name, fn, workers) in enumerate(options):
+        try:
+            fn(texts[0], audios[0])
+        except Exception as e:
+            if k == len(options) - 1:
+                raise
+            why = "no API credit - add funds at fish.audio/app/developers" if "402" in str(e) else str(e)[:100]
+            status(f"⚠️ {name} unavailable ({esc(why)}). Trying the next voice ...")
+            continue
+        status(f"🎙️ Voice: {name}")
+        with ThreadPoolExecutor(workers) as ex:
+            list(ex.map(lambda i: fn(texts[i], audios[i]), range(1, len(texts))))
+        return name
+
+
 # ---------------------------------------------------------------------------
 # Building the video
 # ---------------------------------------------------------------------------
@@ -933,8 +1023,7 @@ def build_preview(handle, seconds=None):
 
         status("🎙️ Generating voice-over with Fish Audio ...")
         audios = [os.path.join(work, f"a{i:03d}.mp3") for i in range(n)]
-        with ThreadPoolExecutor(WORKERS) as ex:
-            list(ex.map(lambda i: fish_tts(new_text[i], audios[i]), range(n)))
+        voice_used = make_voiceovers(new_text, audios)
 
         status(f"🎨 Redrawing {len(unique)} frames in your style with Krea ...")
         ref = krea_reference_url()
