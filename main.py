@@ -31,6 +31,8 @@ Env vars:
   Voice order: Fish Audio -> ElevenLabs -> (Gemini voice, if USE_GEMINI_VOICE = True in the code) -> free Microsoft voice.
   If a voice fails part-way, ALL lines are redone with the next voice so the voice never changes.
   ELEVENLABS_API_KEY  ElevenLabs key (ELEVEN_VOICE_ID / ELEVEN_MODEL optional)
+  Images: Krea first; if it has no balance the bot uses your free Cloudflare Worker.
+  Paste the worker URL into CF_IMAGE_URL near the top of this file (key defaults to 12345678).
   GEMINI_VOICE        optional Gemini voice name (default Kore)
   GEMINI_TTS_MODEL    optional, default gemini-3.1-flash-tts-preview (auto-picks a TTS model if missing)
   EDGE_VOICE          free Microsoft voice (default en-US-AndrewNeural; others: en-US-BrianNeural,
@@ -96,6 +98,10 @@ USE_GEMINI_VOICE = False   # True = try Gemini's voice (tiny free daily quota) b
 ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "") or os.environ.get("ELEVEN_API_KEY", "")
 ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "pNInz6obpgDQGcFmaJgB")   # "Adam" (free-plan premade voice)
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
+# Free image fallback = your Cloudflare Worker. PASTE YOUR WORKER URL on the next line:
+CF_IMAGE_URL = os.environ.get("CF_IMAGE_URL", "") or "https://icon.larpwithjosh.workers.dev/"
+CF_IMAGE_KEY = os.environ.get("CF_IMAGE_KEY", "") or "12345678"   # must match the worker's API_KEY secret
+CF_STYLE = "flat 2D cartoon illustration, thick outlines, simple shapes, vibrant colors, no text"
 STYLE_HINT = os.environ.get("STYLE_HINT", "").strip()
 STYLE_STRENGTH = float(os.environ.get("STYLE_STRENGTH", "0.8"))
 PREVIEW_SECONDS = int(os.environ.get("PREVIEW_SECONDS", "90"))
@@ -963,7 +969,7 @@ def concat(parts, out_path, workdir):
 
 
 def check_setup():
-    missing = [n for n, v in (("KREA_API_KEY", KREA_API_KEY),) if not v]
+    missing = [] if (KREA_API_KEY or CF_IMAGE_URL) else ["KREA_API_KEY or CF_IMAGE_URL"]
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         missing.insert(0, "GEMINI_API_KEY (free at aistudio.google.com)")
     if missing:
@@ -975,96 +981,240 @@ def check_setup():
         status("ℹ️ No style reference image uploaded - images will use Krea's default look.")
 
 
-def build_preview(handle, seconds=None):
+def cf_image(prompt, dest):
+    """Free images from your Cloudflare Worker (Stable Diffusion XL)."""
+    r = http("POST", CF_IMAGE_URL, tries=4, timeout=120,
+             headers={"Authorization": f"Bearer {CF_IMAGE_KEY}", "Content-Type": "application/json",
+                      "User-Agent": "Mozilla/5.0"},
+             json={"prompt": prompt, "width": 1024, "height": 576})
+    if r.status_code != 200 or not r.headers.get("Content-Type", "").startswith("image"):
+        raise RuntimeError(f"Cloudflare image {r.status_code}: {r.text[:150]}")
+    with open(dest, "wb") as f:
+        f.write(r.content)
+
+
+def make_images(unique, prompts, imgdir):
+    """Try the image providers in order. The first that draws EVERY image wins; if one fails on the
+    first image or runs out part-way, all images are redone with the next one (consistent style)."""
+    options = []
+    if KREA_API_KEY:
+        options.append(("Krea", lambda pr, d: krea_image(pr + (". " + STYLE_HINT if STYLE_HINT else ""),
+                                                          krea_reference_url(), d), WORKERS))
+    if CF_IMAGE_URL:
+        options.append(("Cloudflare AI (free)", lambda pr, d: cf_image(pr + ". " + (STYLE_HINT or CF_STYLE), d), 2))
+    if not options:
+        raise RuntimeError("no image provider: set KREA_API_KEY or paste CF_IMAGE_URL in the code")
+
+    def dest(i):
+        return os.path.join(imgdir, f"img{i:03d}.png")
+
+    for k, (name, fn, workers) in enumerate(options):
+        last = k == len(options) - 1
+        try:
+            fn(prompts[unique[0]], dest(unique[0]))
+        except Exception as e:
+            if last:
+                raise
+            why = "no API balance" if "402" in str(e) else str(e)[:100]
+            status(f"⚠️ {name} unavailable ({esc(why)}). Trying the next image provider ...")
+            continue
+        status(f"🎨 Images: {name}")
+        try:
+            with ThreadPoolExecutor(workers) as ex:
+                list(ex.map(lambda i: fn(prompts[i], dest(i)), unique[1:]))
+        except Exception as e:
+            if last:
+                raise
+            status(f"⚠️ {name} failed mid-way ({esc(str(e)[:80])}). Redoing all images with the next provider ...")
+            continue
+        return name
+
+
+# --- saved progress per video (lets a failed run resume, and feeds the dashboard cards) ---
+JOBS_DIR = os.path.join(DATA_DIR, "jobs")
+LAST_JOB = os.path.join(DATA_DIR, "last_job.txt")
+os.makedirs(JOBS_DIR, exist_ok=True)
+job_error = [""]
+
+
+def jread(jd, name):
+    try:
+        with open(os.path.join(jd, name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def jwrite(jd, name, data):
+    tmp = os.path.join(jd, name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, os.path.join(jd, name))
+
+
+def last_job_dir():
+    try:
+        with open(LAST_JOB) as f:
+            d = os.path.join(JOBS_DIR, f.read().strip())
+        return d if os.path.isdir(d) else ""
+    except OSError:
+        return ""
+
+
+def reset_job(jd, vid):
+    shutil.rmtree(jd, ignore_errors=True)
+    os.makedirs(os.path.join(jd, "audio"), exist_ok=True)
+    os.makedirs(os.path.join(jd, "images"), exist_ok=True)
+    jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"]})
+
+
+def build_preview(handle, seconds=None, fresh=False):
     check_setup()
     seconds = max(20, int(seconds or PREVIEW_SECONDS))
     work = tempfile.mkdtemp(prefix="fl_")
+    job_error[0] = ""
     try:
         status(f"🔎 Looking up the latest video on {esc(handle)} ...")
         vid = yt_call(latest_video, handle)
         status(f"📺 Latest video: {esc(vid['title'][:90])}")
 
-        scenes = visuals = owner = frames = None
-        if GEMINI_API_KEY and os.environ.get("WATCH_WITH_GEMINI", "1") != "0":
-            status("👀 Asking Gemini to watch the video (it opens the YouTube link itself - no download needed) ...")
-            try:
-                scenes, visuals, owner = gemini_watch(vid["url"], seconds)
-                n = len(scenes)
-                frames = [None] * n
-                unique = sorted(set(owner))
-                status(f"🎬 Gemini watched it: {n} scenes, {len(unique)} different looks")
-            except Exception as e:
-                print(f"Gemini watch failed: {e}", flush=True)
-                scenes = None
-                status(f"⚠️ Gemini couldn't watch it ({esc(str(e)[:200])}). Trying the downloader instead ...")
+        vkey = re.sub(r"[^\w-]", "", vid["id"]) or "video"
+        jd = os.path.join(JOBS_DIR, vkey)
+        for d in os.listdir(JOBS_DIR):                       # keep only this video's saved progress
+            if d != vkey:
+                shutil.rmtree(os.path.join(JOBS_DIR, d), ignore_errors=True)
+        sc = None if fresh else jread(jd, "scenes.json")
+        if sc and sc.get("seconds") == seconds and sc.get("scenes") and sc.get("owner"):
+            jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"]})
+        else:
+            sc = None
+            reset_job(jd, vid)
+        try:
+            os.remove(os.path.join(jd, "done.json"))
+        except OSError:
+            pass
+        with open(LAST_JOB, "w") as f:
+            f.write(vkey)
 
-        if scenes is None:
-            fetch_cookies_from_github()
-            status("📝 Getting subtitles ...")
-            cues = yt_call(get_subtitles, vid["url"], work)
-            status(f"📝 {len(cues)} subtitle lines")
-
-            status(f"⬇️ Downloading the first {seconds}s to watch it ...")
-            src = None
-            try:
-                src = yt_call(download_clip, vid["url"], work, seconds)
-            except Exception as e:
-                print(f"Video download failed: {e}", flush=True)
-                status("⚠️ YouTube blocked the video download, so the bot can't watch it. "
-                       "Building from the script only (images are drawn from the narration, not the original frames).")
-
-            if src:
-                total = min(duration(src), seconds)
-                status("👀 Watching the video and finding scene changes ...")
-                scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
-            else:
-                total = min(float(seconds), max([b for _, b, _ in cues] + [0.0]))
-                scenes = attach_text(build_scenes([], total), cues)
-            if not scenes:
-                raise RuntimeError("no spoken lines found in that stretch of the video")
+        # ---- stage 2: scenes ----
+        if sc:
+            scenes, visuals, owner = sc["scenes"], sc.get("visuals"), sc["owner"]
             n = len(scenes)
-
-            # one frame per scene; scenes that look the same as the previous one reuse its image
-            frames, owner, hashes = [], [], []
-            for i, (a, b, _) in enumerate(scenes):
-                if not src:
-                    frames.append(None)
-                    owner.append(i)
-                    continue
-                fp = os.path.join(work, f"f{i:03d}.jpg")
-                grab_frame(src, (a + b) / 2, fp)
-                frames.append(fp)
-                h = dhash(fp)
-                same = (i > 0 and h is not None and hashes[i - 1] is not None
-                        and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
-                hashes.append(h)
-                owner.append(owner[i - 1] if same else i)
+            frames = [None] * n
             unique = sorted(set(owner))
-            status(f"🎬 {n} scenes, {len(unique)} different looks"
-                   + (" (reusing images when the video didn't change)" if src else ""))
+            status(f"♻️ Reusing the {n} scenes saved from the last run (tick 'Start fresh' to redo everything).")
+        else:
+            scenes = visuals = owner = frames = None
+            if GEMINI_API_KEY and os.environ.get("WATCH_WITH_GEMINI", "1") != "0":
+                status("👀 Asking Gemini to watch the video (it opens the YouTube link itself - no download needed) ...")
+                try:
+                    scenes, visuals, owner = gemini_watch(vid["url"], seconds)
+                    n = len(scenes)
+                    frames = [None] * n
+                    unique = sorted(set(owner))
+                    status(f"🎬 Gemini watched it: {n} scenes, {len(unique)} different looks")
+                except Exception as e:
+                    print(f"Gemini watch failed: {e}", flush=True)
+                    scenes = None
+                    status(f"⚠️ Gemini couldn't watch it ({esc(str(e)[:200])}). Trying the downloader instead ...")
 
-        status("✍️ Rewriting the narration (same meaning, new structure) ...")
-        new_text = rewrite_scenes(scenes, vid["title"])
+            if scenes is None:
+                fetch_cookies_from_github()
+                status("📝 Getting subtitles ...")
+                cues = yt_call(get_subtitles, vid["url"], work)
+                status(f"📝 {len(cues)} subtitle lines")
 
-        status("🎙️ Generating voice-over ...")
-        audios = [os.path.join(work, f"a{i:03d}.mp3") for i in range(n)]
-        voice_used = make_voiceovers(new_text, audios)
+                status(f"⬇️ Downloading the first {seconds}s to watch it ...")
+                src = None
+                try:
+                    src = yt_call(download_clip, vid["url"], work, seconds)
+                except Exception as e:
+                    print(f"Video download failed: {e}", flush=True)
+                    status("⚠️ YouTube blocked the video download, so the bot can't watch it. "
+                           "Building from the script only (images are drawn from the narration, not the original frames).")
 
-        status(f"🎨 Redrawing {len(unique)} frames in your style with Krea ...")
-        ref = krea_reference_url()
-        images, prompts = {}, {}
+                if src:
+                    total = min(duration(src), seconds)
+                    status("👀 Watching the video and finding scene changes ...")
+                    scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
+                else:
+                    total = min(float(seconds), max([b for _, b, _ in cues] + [0.0]))
+                    scenes = attach_text(build_scenes([], total), cues)
+                if not scenes:
+                    raise RuntimeError("no spoken lines found in that stretch of the video")
+                n = len(scenes)
 
-        def make_image(i):
-            p = visuals[i] if visuals else describe_frame(frames[i], scenes[i][2])
-            if STYLE_HINT:
-                p += ". " + STYLE_HINT
-            dest = os.path.join(work, f"img{i:03d}.png")
-            krea_image(p, ref, dest)
-            images[i], prompts[i] = dest, p
+                frames, owner, hashes = [], [], []
+                for i, (a, b, _) in enumerate(scenes):
+                    if not src:
+                        frames.append(None)
+                        owner.append(i)
+                        continue
+                    fp = os.path.join(work, f"f{i:03d}.jpg")
+                    grab_frame(src, (a + b) / 2, fp)
+                    frames.append(fp)
+                    h = dhash(fp)
+                    same = (i > 0 and h is not None and hashes[i - 1] is not None
+                            and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
+                    hashes.append(h)
+                    owner.append(owner[i - 1] if same else i)
+                unique = sorted(set(owner))
+                status(f"🎬 {n} scenes, {len(unique)} different looks"
+                       + (" (reusing images when the video didn't change)" if src else ""))
+            jwrite(jd, "scenes.json", {"seconds": seconds, "scenes": scenes, "visuals": visuals, "owner": owner})
 
-        with ThreadPoolExecutor(WORKERS) as ex:
-            list(ex.map(make_image, unique))
+        # ---- stage 3: rewrite ----
+        rw = jread(jd, "rewrite.json")
+        if rw and len(rw.get("text") or []) == n:
+            new_text = rw["text"]
+            status("♻️ Reusing the saved rewrite.")
+        else:
+            status("✍️ Rewriting the narration (same meaning, new structure) ...")
+            new_text = rewrite_scenes(scenes, vid["title"])
+            for stale in ("voice.json", "images.json"):
+                try:
+                    os.remove(os.path.join(jd, stale))
+                except OSError:
+                    pass
+            jwrite(jd, "rewrite.json", {"text": new_text})
 
+        # ---- stage 4: voice-over ----
+        audios = [os.path.join(jd, "audio", f"a{i:03d}.mp3") for i in range(n)]
+        vo = jread(jd, "voice.json")
+        if vo and all(os.path.isfile(a) and os.path.getsize(a) > 500 for a in audios):
+            voice_used = vo.get("name", "")
+            status(f"♻️ Reusing the saved voice-over ({esc(voice_used)}).")
+        else:
+            status("🎙️ Generating voice-over ...")
+            voice_used = make_voiceovers(new_text, audios)
+            jwrite(jd, "voice.json", {"name": voice_used})
+
+        # ---- stage 5: images ----
+        imgdir = os.path.join(jd, "images")
+        images = {i: os.path.join(imgdir, f"img{i:03d}.png") for i in unique}
+        im = jread(jd, "images.json")
+        if im and all(os.path.isfile(pth) for pth in images.values()):
+            prompts = {int(k): v for k, v in (im.get("prompts") or {}).items()}
+            provider = im.get("provider", "")
+            status(f"♻️ Reusing the saved images ({esc(provider)}).")
+        else:
+            for fn_ in os.listdir(imgdir):
+                try:
+                    os.remove(os.path.join(imgdir, fn_))
+                except OSError:
+                    pass
+            status(f"🎨 Redrawing {len(unique)} frames ...")
+            prompts = {}
+
+            def get_prompt(i):
+                prompts[i] = visuals[i] if visuals else describe_frame(frames[i], scenes[i][2])
+
+            with ThreadPoolExecutor(WORKERS) as ex:
+                list(ex.map(get_prompt, unique))
+            provider = make_images(unique, prompts, imgdir)
+            jwrite(jd, "images.json", {"provider": provider, "prompts": {str(k): v for k, v in prompts.items()}})
+
+        # ---- stage 6: final video ----
         status("🎞️ Animating scenes and joining them ...")
         parts = []
         for i in range(n):
@@ -1075,13 +1225,14 @@ def build_preview(handle, seconds=None):
         concat(parts, final, work)
         shutil.move(final, os.path.join(OUT_DIR, "preview.mp4"))
 
-        lines = [f"SOURCE: {vid['title']}  ({vid['url']})", f"VOICE: {voice_used}", ""]
+        lines = [f"SOURCE: {vid['title']}  ({vid['url']})", f"VOICE: {voice_used}", f"IMAGES: {provider}", ""]
         for i, (a, b, t) in enumerate(scenes):
             lines += [f"--- Scene {i + 1}  [{a:.1f}s-{b:.1f}s]  image from scene {owner[i] + 1}",
                       f"ORIGINAL : {t}", f"REWRITTEN: {new_text[i]}",
                       f"IMAGE PROMPT: {prompts.get(owner[i], '')}", ""]
         with open(os.path.join(OUT_DIR, "script.txt"), "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
+        jwrite(jd, "done.json", {"voice": voice_used, "images": provider})
 
         mb = os.path.getsize(os.path.join(OUT_DIR, "preview.mp4")) / 1_000_000
         status(f'✅ Preview ready ({mb:.1f} MB): <a href="/out/preview.mp4" target="_blank">watch</a> '
@@ -1098,16 +1249,17 @@ job_lock = threading.Lock()
 job_running = False
 
 
-def run_job(handle, seconds):
+def run_job(handle, seconds, fresh=False):
     global job_running
     if not job_lock.acquire(blocking=False):
         status("⏳ A preview is already being built.")
         return
     job_running = True
     try:
-        build_preview(handle, seconds)
+        build_preview(handle, seconds, fresh)
     except Exception as e:
         print(f"Job failed: {type(e).__name__}: {e}", flush=True)
+        job_error[0] = str(e)[:300] or "failed"
         if "Sign in to confirm" in str(e):
             have = "Your cookies were rejected or expired - export fresh ones" if cookies_path() else "Upload a YouTube cookies.txt on the dashboard (or set YOUTUBE_COOKIES_B64)"
             status(f"❌ YouTube thinks the server is a bot. {have}.")
@@ -1136,56 +1288,166 @@ button{background:linear-gradient(135deg,var(--a),var(--a2));color:#fff;border:0
 a{color:var(--a2);text-decoration:none}.hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
 .warn{border-color:rgba(255,59,92,.4);color:#ffb3c0;font-size:13px}video{width:100%;border-radius:12px;background:#000}
 img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);display:block;margin-bottom:8px}
+details{background:var(--p2);border:1px solid var(--border);border-radius:12px;margin-bottom:8px}
+summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
+.sb{padding:4px 14px 14px;font-size:13px;line-height:1.5}
+.sc{border-top:1px solid var(--border);padding:8px 0}.m{color:var(--muted);font-size:12px}
+.rw{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}.rw div{background:#08080d;border-radius:8px;padding:8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
+.grid img{width:100%;border-radius:8px;display:block}audio{width:100%;height:34px;margin-top:4px}
+@media(max-width:560px){.rw{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <h1>Faceless Bot - preview</h1><div class="sub">Channel in, rebuilt video out. Nothing is posted.</div>
 @@WARN@@
 <div class="card"><h2>1. Your animation style</h2>@@REF@@
 <input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"> <span id="upmsg" class="hint"></span>
-<div class="hint">Every redrawn frame copies the look of this image.</div></div>
+<div class="hint">Krea copies the look of this image. (The free Cloudflare fallback can't use it.)</div></div>
 <div class="card"><h2>YouTube cookies (only for the downloader fallback)</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
 <input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
 <input type="text" name="handle" placeholder="@channelname" required>
 <label>Seconds of the video to rebuild</label><input type="number" name="seconds" min="20" max="600" value="@@SECS@@">
-<button type="submit">@@BTN@@</button></form>
-<div class="hint">Short previews are cheap: about one Krea image per scene change.</div></div>
-<div class="card"><h2>Activity</h2><div class="feed">@@FEED@@</div></div>
-@@VIDEO@@
+<label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="fresh" value="1"> Start fresh (ignore saved progress)</label>
+<button type="submit" id="runbtn">@@BTN@@</button></form>
+<div class="hint">If a run fails, running again on the same video continues from the saved stages instead of paying for them twice.</div></div>
+<div id="live">@@LIVE@@</div>
 </div><script>
 async function up(i){const f=i.files[0];if(!f)return;document.getElementById('upmsg').textContent='Uploading...';
 const r=await fetch('/upload-ref?name='+encodeURIComponent(f.name),{method:'PUT',body:f});
 if(!r.ok){document.getElementById('upmsg').textContent='Failed: '+await r.text();return}location.reload()}
 async function upc(i){const f=i.files[0];if(!f)return;const r=await fetch('/upload-cookies',{method:'PUT',body:f});
 if(!r.ok){document.getElementById('upc').textContent='Failed: '+await r.text();return}location.reload()}
+let last="";
+async function poll(){try{const r=await fetch('/?partial=1');const run=r.headers.get('X-Running')==='1';const t=await r.text();
+if(t!==last){const open=[...document.querySelectorAll('#live details[open]')].map(d=>d.dataset.id);
+document.getElementById('live').innerHTML=t;last=t;
+document.querySelectorAll('#live details').forEach(d=>{if(open.includes(d.dataset.id))d.open=true})}
+document.getElementById('runbtn').textContent=run?'Building...':'Build preview';
+if(run)setTimeout(poll,4000)}catch(e){setTimeout(poll,6000)}}
 @@RELOAD@@
 </script></body></html>"""
+
+
+def _mt(path):
+    try:
+        return int(os.path.getmtime(path))
+    except OSError:
+        return 0
+
+
+def stages_html():
+    jd = last_job_dir()
+    if not jd:
+        return ""
+    vd = jread(jd, "video.json") or {}
+    sc = jread(jd, "scenes.json") or {}
+    rw = jread(jd, "rewrite.json") or {}
+    vo = jread(jd, "voice.json") or {}
+    im = jread(jd, "images.json") or {}
+    dn = jread(jd, "done.json") or {}
+    scenes = sc.get("scenes") or []
+    visuals = sc.get("visuals") or []
+    owner = sc.get("owner") or []
+    texts = rw.get("text") or []
+    prompts = {int(k): v for k, v in (im.get("prompts") or {}).items()}
+    flags = [bool(vd), bool(scenes), bool(texts), bool(vo), bool(im), bool(dn)]
+    pend = next((i for i, f in enumerate(flags) if not f), None)
+
+    def icon(i):
+        if flags[i]:
+            return "✅"
+        if i == pend and job_error[0]:
+            return "❌"
+        if i == pend and job_running:
+            return "⏳"
+        return "⚪"
+
+    b0 = (f'<div>{esc(vd.get("title"))}</div><div class="m"><a href="{esc(vd.get("url"))}" target="_blank">'
+          f'{esc(vd.get("url"))}</a></div>') if vd else ""
+
+    b1 = ""
+    for i, (a, b, t) in enumerate(scenes):
+        vis = visuals[i] if i < len(visuals) and visuals[i] else ""
+        b1 += (f'<div class="sc"><b>Scene {i + 1}</b> <span class="m">{a:.1f}s-{b:.1f}s</span><div>{esc(t)}</div>'
+               + (f'<div class="m">Image prompt: {esc(vis)}</div>' if vis else "") + "</div>")
+
+    b2 = ""
+    for i, (a, b, t) in enumerate(scenes):
+        if i < len(texts):
+            b2 += (f'<div class="sc"><b>Scene {i + 1}</b><div class="rw"><div><span class="m">Original</span><br>{esc(t)}</div>'
+                   f'<div><span class="m">Rewritten</span><br>{esc(texts[i])}</div></div></div>')
+
+    b3 = ""
+    if vo:
+        b3 = f'<div class="m">Voice used: {esc(vo.get("name"))}</div>'
+        for i in range(len(texts)):
+            ap = os.path.join(jd, "audio", f"a{i:03d}.mp3")
+            if os.path.isfile(ap):
+                b3 += (f'<div class="sc"><b>Scene {i + 1}</b><div>{esc(texts[i])}</div>'
+                       f'<audio controls preload="none" src="/job/audio/a{i:03d}.mp3?v={_mt(ap)}"></audio></div>')
+
+    b4 = ""
+    if im:
+        b4 = f'<div class="m">Drawn with: {esc(im.get("provider"))} &middot; tap an image to open it full size</div><div class="grid">'
+        for i in sorted(set(owner)):
+            ip = os.path.join(jd, "images", f"img{i:03d}.png")
+            if os.path.isfile(ip):
+                used = [str(k + 1) for k, o in enumerate(owner) if o == i]
+                u = f"/job/images/img{i:03d}.png?v={_mt(ip)}"
+                b4 += (f'<div><a href="{u}" target="_blank"><img loading="lazy" src="{u}"></a>'
+                       f'<div class="m">Scene {esc(", ".join(used))}: {esc(prompts.get(i, ""))}</div></div>')
+        b4 += "</div>"
+
+    b5 = ""
+    if dn:
+        pv = os.path.join(OUT_DIR, "preview.mp4")
+        b5 = (f'<video controls preload="metadata" src="/out/preview.mp4?t={_mt(pv)}"></video>'
+              f'<div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div>')
+
+    if job_error[0] and pend is not None:
+        err = f'<div class="m" style="color:#ffb3c0">Stopped here: {esc(job_error[0][:200])}</div>'
+        bodies = [b0, b1, b2, b3, b4, b5]
+        bodies[pend] += err
+        b0, b1, b2, b3, b4, b5 = bodies
+
+    n = len(scenes)
+    titles = ["1. Latest video found",
+              f"2. Gemini watched the video{f' ({n} scenes)' if n else ''}",
+              "3. Narration rewritten",
+              f"4. Voice-over{f' ({esc(vo.get(chr(110) + chr(97) + chr(109) + chr(101)))})' if vo else ''}",
+              f"5. Images redrawn{f' ({esc(im.get(chr(112) + chr(114) + chr(111) + chr(118) + chr(105) + chr(100) + chr(101) + chr(114)))})' if im else ''}",
+              "6. Final video"]
+    bodies = [b0, b1, b2, b3, b4, b5]
+    return "".join(f'<details data-id="s{i}"><summary>{icon(i)} {titles[i]}</summary><div class="sb">{bodies[i]}</div></details>'
+                   for i in range(6))
+
+
+def live_html():
+    with status_lock:
+        items = list(status_feed[-30:])
+    feed = "\n".join(f'<div class="fi">{i}</div>' for i in reversed(items)) or '<div class="hint">Nothing yet.</div>'
+    st = stages_html()
+    out = f'<div class="card"><h2>Stages (tap to open)</h2>{st}</div>' if st else ""
+    return out + f'<div class="card"><h2>Activity</h2><div class="feed">{feed}</div></div>'
 
 
 def render_page():
     warns = []
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         warns.append("GEMINI_API_KEY is not set (free key at aistudio.google.com)")
-    if not KREA_API_KEY:
-        warns.append("KREA_API_KEY is not set")
+    if not (KREA_API_KEY or CF_IMAGE_URL):
+        warns.append("No image provider: set KREA_API_KEY or paste CF_IMAGE_URL in the code")
     warn = "".join(f'<div class="card warn">&#9888; {esc(w)}</div>' for w in warns)
-    with status_lock:
-        items = list(status_feed[-30:])
-    feed = "\n".join(f'<div class="fi">{i}</div>' for i in reversed(items)) or '<div class="hint">Nothing yet.</div>'
     ref = f'<img class="ref" src="/ref?t={int(time.time())}">' if reference_path() else \
         '<div class="hint" style="margin:0 0 8px">No reference image yet.</div>'
-    pv = os.path.join(OUT_DIR, "preview.mp4")
-    video = ""
-    if os.path.isfile(pv):
-        video = (f'<div class="card"><h2>Latest preview</h2><video controls src="/out/preview.mp4?t={int(os.path.getmtime(pv))}">'
-                 f'</video><div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div></div>')
     ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
           "No cookies. Not needed while Gemini can watch the video.")
-    rep = {"@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@FEED@@": feed, "@@VIDEO@@": video,
-           "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
-           "@@RELOAD@@": "setTimeout(()=>location.reload(),4000);" if job_running else ""}
+    rep_ = {"@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
+            "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
+            "@@RELOAD@@": "poll();" if job_running else ""}
     page = PAGE
-    for k, v in rep.items():
+    for k, v in rep_.items():
         page = page.replace(k, v)
     return page
 
@@ -1263,7 +1525,22 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._deny()
         if path == "/":
+            if "partial=1" in urllib.parse.urlparse(self.path).query:
+                body = live_html().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("X-Running", "1" if job_running else "0")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             return self._send(200, render_page().encode(), "text/html; charset=utf-8")
+        if path.startswith("/job/"):
+            jd = last_job_dir()
+            rel = urllib.parse.unquote(path[5:])
+            if jd and re.match(r"^(audio|images)/[\w.-]+$", rel):
+                return self._serve_file(os.path.join(jd, rel))
+            return self._send(404, b"not found")
         if path in ("/out/preview.mp4", "/out/script.txt"):
             return self._serve_file(os.path.join(OUT_DIR, os.path.basename(path)))
         if path == "/ref":
@@ -1317,9 +1594,10 @@ class Handler(BaseHTTPRequestHandler):
             seconds = int((f.get("seconds") or [str(PREVIEW_SECONDS)])[0])
         except ValueError:
             seconds = PREVIEW_SECONDS
+        fresh = bool((f.get("fresh") or [""])[0])
         if handle:
-            status(f"▶️ Preview started for {esc(handle)}.")
-            threading.Thread(target=run_job, args=(handle, seconds), daemon=True).start()
+            status(f"▶️ Preview started for {esc(handle)}" + (" (fresh start)." if fresh else "."))
+            threading.Thread(target=run_job, args=(handle, seconds, fresh), daemon=True).start()
         self.send_response(303)
         self.send_header("Location", "/")
         self.send_header("Content-Length", "0")
