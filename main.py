@@ -57,6 +57,7 @@ Env vars (all of these can ALSO be typed into the dashboard Settings card, which
                       (e.g. "flat 2D cartoon, thick outlines")
   STYLE_STRENGTH      optional 0-1, how strongly the reference style applies (0.8)
   PREVIEW_SECONDS     optional, how much of the source video to rebuild (90)
+  WHOLE_MAX_SECONDS   optional, longest video the 'whole video' option will analyse (default 1800)
   OUT_W / OUT_H       optional output size, default 1280x720
   YOUTUBE_COOKIES_URL optional GitHub link to a cookies.txt (only used by the downloader fallback).
                       If the repo is PRIVATE also set GITHUB_TOKEN.
@@ -111,7 +112,7 @@ GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Kore")
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
 USE_GEMINI_VOICE = os.environ.get("USE_GEMINI_VOICE", "0").lower() in ("1", "true", "yes")   # tiny free daily quota
 ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "") or os.environ.get("ELEVEN_API_KEY", "")
-ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "pNInz6obpgDQGcFmaJgB")   # "Adam" (free-plan premade voice)
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "auq43ws1oslv0tO4BDa7")   # your chosen voice (change it in Settings)
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
 # Free image fallback = your Cloudflare Worker.
 CF_IMAGE_URL = os.environ.get("CF_IMAGE_URL", "") or "https://icon.larpwithjosh.workers.dev/"
@@ -125,6 +126,7 @@ PREVIEW_SECONDS = int(os.environ.get("PREVIEW_SECONDS", "90"))
 OUT_W = int(os.environ.get("OUT_W", "1280"))
 OUT_H = int(os.environ.get("OUT_H", "720"))
 FPS = 30
+WHOLE_MAX = int(os.environ.get("WHOLE_MAX_SECONDS", "1800"))   # longest video analysed with "whole video" (30 min)
 SUB_LANGS = os.environ.get("SUB_LANGS", "en,en.*").split(",")
 YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
 YOUTUBE_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL", "").strip()
@@ -873,33 +875,72 @@ def _secs(v):
     return float(v)
 
 
-def gemini_watch(video_url, seconds):
-    """Let Gemini open the YouTube link itself and describe the first `seconds`.
-    Returns (scenes[[start,end,text]], visuals[prompt], owner[image index per scene])."""
+def _watch_range(video_url, t0, t1):
+    """Gemini watches seconds t0..t1 of the video. Returns rows [start, end, narration, visual, same]
+    with times counted from the start of the WHOLE video."""
+    extra = ""
+    if t0 > 0:
+        extra = (f"\n\nYou are only shown seconds {int(t0)} to {int(t1)} of the video. Give every start and end "
+                 f"as seconds counted from the START OF THE WHOLE VIDEO (the first scene begins at about {int(t0)}).")
     parts = [{"file_data": {"file_uri": video_url},
-              "video_metadata": {"start_offset": "0s", "end_offset": f"{int(seconds)}s"}},
-             {"text": WATCH_PROMPT.replace("{N}", str(int(seconds)))}]
+              "video_metadata": {"start_offset": f"{int(t0)}s", "end_offset": f"{int(t1)}s"}},
+             {"text": WATCH_PROMPT.replace("{N}", str(int(t1 - t0))) + extra}]
     raw = gemini_call("", parts, max_tokens=16000, json_mode=True, temperature=0.3, timeout=600)
-    items = parse_json_list(raw)
-    scenes, visuals, same = [], [], []
-    for it in items:
+    rows = []
+    for it in parse_json_list(raw):
         try:
             a, b = _secs(it["start"]), _secs(it["end"])
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
-        if a >= seconds or b <= a:
+        rows.append([a, b, re.sub(r"\s+", " ", str(it.get("narration") or "")).strip(),
+                     str(it.get("visual") or "").strip(), bool(it.get("same_as_previous"))])
+    if t0 > 0 and rows and min(r[0] for r in rows) < t0 - 1.5:     # Gemini counted from the clip start: shift
+        for r in rows:
+            r[0] += t0
+            r[1] += t0
+    out = []
+    for r in rows:
+        if r[0] >= t1 + 1:
             continue
-        text = re.sub(r"\s+", " ", str(it.get("narration") or "")).strip()
-        vis = str(it.get("visual") or "").strip()
+        r[1] = min(r[1], t1)
+        if r[1] > r[0]:
+            out.append(r)
+    return out
+
+
+def gemini_watch(video_url, seconds, chunk=180):
+    """Let Gemini open the YouTube link itself and describe the first `seconds`
+    (long videos are watched in chunks). Returns (scenes[[start,end,text]], visuals[prompt], owner)."""
+    seconds = int(seconds)
+    flat = []
+    t = 0
+    while t < seconds:
+        t1 = min(seconds, t + chunk)
+        if seconds - t1 < 20:
+            t1 = seconds
+        if seconds > chunk:
+            status(f"👀 Gemini is watching {t}s - {t1}s of {seconds}s ...")
+        part, last = None, None
+        for _ in range(2):
+            try:
+                part = _watch_range(video_url, t, t1)
+                break
+            except Exception as e:
+                last = e
+                time.sleep(5)
+        if part is None:
+            raise RuntimeError(f"Gemini failed on {t}s-{t1}s: {str(last)[:200]}")
+        flat += part
+        t = t1
+    flat.sort(key=lambda r: r[0])
+    scenes, visuals, same = [], [], []
+    for a, b, text, vis, sm in flat:
         if not text and scenes:                        # silent stretch joins the previous scene
-            scenes[-1][1] = b
+            scenes[-1][1] = max(scenes[-1][1], b)
             continue
-        if not text:                                   # silent start: carry its timing into the next scene
-            scenes.append([a, b, ""])
-        else:
-            scenes.append([a, b, text])
+        scenes.append([a, b, text])                    # (a silent start is merged into the next scene below)
         visuals.append(vis)
-        same.append(bool(it.get("same_as_previous")))
+        same.append(sm)
     if len(scenes) > 1 and not scenes[0][2]:
         scenes[1][0] = scenes[0][0]
         scenes.pop(0), visuals.pop(0), same.pop(0)
@@ -1824,7 +1865,37 @@ def reset_job(jd, vid):
     jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"]})
 
 
-def build_preview(handle, seconds=None, fresh=False):
+def video_length(video_url):
+    """Length of the video in seconds (0 if it can't be found)."""
+    try:
+        r = http("GET", video_url, timeout=30, headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"})
+        m = re.search(r'"lengthSeconds":"(\d+)"', r.text)
+        if m and int(m.group(1)) > 0:
+            return int(m.group(1))
+    except Exception as e:
+        print(f"length via page failed: {e}", flush=True)
+    try:
+        import yt_dlp
+        with yt_dlp.YoutubeDL(ydl_opts(cookies=False, skip_download=True)) as y:
+            d = (y.extract_info(video_url, download=False) or {}).get("duration")
+        if d:
+            return int(d)
+    except Exception as e:
+        print(f"length via yt-dlp failed: {e}", flush=True)
+    if GEMINI_API_KEY:
+        try:
+            out = gemini_call("", [{"file_data": {"file_uri": video_url}},
+                                   {"text": "How long is this video in seconds? Reply with only the number."}],
+                              max_tokens=20, temperature=0, timeout=300)
+            m = re.search(r"\d+", out)
+            if m:
+                return int(m.group(0))
+        except Exception as e:
+            print(f"length via Gemini failed: {e}", flush=True)
+    return 0
+
+
+def build_preview(handle, seconds=None, fresh=False, whole=False):
     check_setup()
     seconds = max(20, int(seconds or PREVIEW_SECONDS))
     work = tempfile.mkdtemp(prefix="fl_")
@@ -1833,6 +1904,17 @@ def build_preview(handle, seconds=None, fresh=False):
         status(f"🔎 Looking up the latest video on {esc(handle)} ...")
         vid = yt_call(latest_video, handle)
         status(f"📺 Latest video: {esc(vid['title'][:90])}")
+        if whole:
+            status("📏 Checking how long the video is ...")
+            length = video_length(vid["url"])
+            if length <= 0:
+                status(f"⚠️ Couldn't read the video length - using the first {seconds}s instead.")
+            else:
+                if length > WHOLE_MAX:
+                    status(f"⚠️ The video is {length // 60} min; analysing only the first {WHOLE_MAX // 60} min (WHOLE_MAX_SECONDS).")
+                    length = WHOLE_MAX
+                seconds = int(length)
+                status(f"📏 Analysing the whole video ({seconds // 60}:{seconds % 60:02d}).")
 
         vkey = re.sub(r"[^\w-]", "", vid["id"]) or "video"
         jd = os.path.join(JOBS_DIR, vkey)
@@ -2005,14 +2087,14 @@ job_lock = threading.Lock()
 job_running = False
 
 
-def run_job(handle, seconds, fresh=False):
+def run_job(handle, seconds, fresh=False, whole=False):
     global job_running
     if not job_lock.acquire(blocking=False):
         status("⏳ A preview is already being built.")
         return
     job_running = True
     try:
-        build_preview(handle, seconds, fresh)
+        build_preview(handle, seconds, fresh, whole)
     except Exception as e:
         print(f"Job failed: {type(e).__name__}: {e}", flush=True)
         job_error[0] = str(e)[:300] or "failed"
@@ -2067,7 +2149,8 @@ summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
 <input type="text" name="handle" placeholder="@channelname" value="@@HANDLE@@" required>
-<label>Seconds of the video to rebuild</label><input type="number" name="seconds" min="20" max="600" value="@@SECS@@">
+<label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="whole" value="1" @@WHOLE@@ onchange="document.getElementById('secs').disabled=this.checked"> Analyse the whole video</label>
+<label>...or only the first N seconds</label><input id="secs" type="number" name="seconds" min="20" max="3600" value="@@SECS@@" @@SECSDIS@@>
 <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="fresh" value="1"> Start fresh (ignore saved progress)</label>
 <button type="submit" id="runbtn">@@BTN@@</button></form>
 <div class="hint">If a run fails, running again on the same video continues from the saved stages instead of paying for them twice.</div></div>
@@ -2235,7 +2318,9 @@ def render_page():
     rep_ = {"@@STORE@@": store_card(), "@@SETTINGS@@": settings_card(), "@@KREA@@": krea_card(),
             "@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
             "@@HANDLE@@": esc(settings_load().get("LAST_HANDLE", "")),
-            "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
+            "@@SECS@@": str(PREVIEW_SECONDS),
+            "@@WHOLE@@": "checked" if settings_load().get("LAST_WHOLE", "1") == "1" else "",
+            "@@SECSDIS@@": "disabled" if settings_load().get("LAST_WHOLE", "1") == "1" else "", "@@BTN@@": "Building..." if job_running else "Build preview",
             "@@RELOAD@@": "poll();" if job_running else ""}
     page = PAGE
     for k, v in rep_.items():
@@ -2440,13 +2525,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             seconds = PREVIEW_SECONDS
         fresh = bool((f.get("fresh") or [""])[0])
+        whole = bool((f.get("whole") or [""])[0])
         if handle:
             try:
-                settings_update({"LAST_HANDLE": handle, "PREVIEW_SECONDS": str(seconds)})
+                settings_update({"LAST_HANDLE": handle, "PREVIEW_SECONDS": str(seconds),
+                                 "LAST_WHOLE": "1" if whole else "0"})
             except Exception as e:
                 print(f"couldn't save run settings: {e}", flush=True)
-            status(f"▶️ Preview started for {esc(handle)}" + (" (fresh start)." if fresh else "."))
-            threading.Thread(target=run_job, args=(handle, seconds, fresh), daemon=True).start()
+            status(f"▶️ Preview started for {esc(handle)}" + (" (whole video)" if whole else f" (first {seconds}s)")
+                   + (", fresh start." if fresh else "."))
+            threading.Thread(target=run_job, args=(handle, seconds, fresh, whole), daemon=True).start()
         self.send_response(303)
         self.send_header("Location", "/")
         self.send_header("Content-Length", "0")
