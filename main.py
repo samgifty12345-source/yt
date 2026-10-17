@@ -2,43 +2,39 @@
 
 What it does, step by step:
   1. You give it a YouTube channel handle (e.g. @somechannel).
-  2. It finds the channel's latest long-form video and downloads its subtitles.
-  3. It watches the video (scene-change detection) and cuts it into scenes.
-     Each scene = the stretch of video between two visual changes.
-  4. the AI rewrites the narration of every scene: new sentence structure,
+  2. It finds the channel's latest long-form video.
+  3. Gemini WATCHES the video (opens the public YouTube link itself) and returns the
+     scenes: what is said + what is on screen. Fallback: yt-dlp subtitles + scene detection.
+  4. The AI rewrites the narration of every scene: new sentence structure,
      same meaning (facts, numbers, order of ideas all kept).
-  5. Fish Audio turns each rewritten scene into voice-over.
-  6. For each scene, ONE frame is looked at by the AI (vision), which writes a
-     prompt describing its composition. Krea then redraws that frame in YOUR
-     animation style (your reference image). If the next scene looks the same
-     as the previous one, the image is reused instead of regenerated.
+  5. Voice-over is generated for each scene (Fish Audio -> Microsoft free voice;
+     Gemini voice only if USE_GEMINI_VOICE=1).
+  6. Krea redraws each scene in YOUR animation style (your reference image).
+     If the next scene looks the same as the previous one, the image is reused.
   7. Every image gets a slow zoom / pan that lasts exactly as long as that
      scene's voice-over, then everything is stitched into one video.
 
 Output: data/out/preview.mp4 + data/out/script.txt (original vs rewritten, per
 scene, so you can check the meaning really stayed the same).
 
-NEW - works fully online (no PC, no cookies, no proxy): Gemini can open a public YouTube link
-itself, so the bot asks Gemini to WATCH the video and return the scenes (what is said +
-what is on screen). YouTube never sees Railway's IP. If that fails, the bot falls back to
-yt-dlp / youtube-transcript-api (which need cookies / a non-datacenter IP).
-
 Env vars:
-  GEMINI_API_KEY      Google Gemini key (FREE tier works) - rewrite + frame description
+  GEMINI_API_KEY      Google Gemini key (FREE tier works) - watch + rewrite + frame description
                       get one at aistudio.google.com -> Get API key
   ANTHROPIC_API_KEY   optional alternative to Gemini (paid). Gemini is used if both are set
   GEMINI_MODEL        optional, default gemini-2.5-flash (if Google removed it, the bot
                       automatically picks the newest Gemini Flash model)
   WATCH_WITH_GEMINI   optional, set to 0 to skip the Gemini 'watch' step
   KREA_API_KEY        Krea API token (krea.ai/settings/api-tokens)
-  FISH_API_KEY        Fish Audio key
+  FISH_API_KEY        Fish Audio key (optional now - skipped automatically if it has no credit)
   FISH_VOICE_ID       optional, your Fish voice model id (default voice if empty)
   FISH_MODEL          optional, default s2-pro
-  Voice order: Fish Audio -> Gemini voice (free, uses GEMINI_API_KEY) -> free Microsoft voice.
-  The first one that works is used for the whole video.
-  GEMINI_VOICE        optional Gemini voice name (default Kore; others: Puck, Charon, Fenrir, Aoede, Orus...)
+  Voice order: Fish Audio -> ElevenLabs -> (Gemini voice, if USE_GEMINI_VOICE = True in the code) -> free Microsoft voice.
+  If a voice fails part-way, ALL lines are redone with the next voice so the voice never changes.
+  ELEVENLABS_API_KEY  ElevenLabs key (ELEVEN_VOICE_ID / ELEVEN_MODEL optional)
+  GEMINI_VOICE        optional Gemini voice name (default Kore)
   GEMINI_TTS_MODEL    optional, default gemini-3.1-flash-tts-preview (auto-picks a TTS model if missing)
-  EDGE_VOICE          optional, last-resort free voice (default en-US-GuyNeural)
+  EDGE_VOICE          free Microsoft voice (default en-US-AndrewNeural; others: en-US-BrianNeural,
+                      en-US-ChristopherNeural, en-GB-RyanNeural, en-US-AriaNeural, en-US-JennyNeural)
   CLAUDE_MODEL        optional (only if using Anthropic), default claude-sonnet-5-5
   KREA_MODEL          optional, default krea/krea-2/medium
   STYLE_HINT          optional text added to every image prompt
@@ -46,20 +42,15 @@ Env vars:
   STYLE_STRENGTH      optional 0-1, how strongly the reference style applies (0.8)
   PREVIEW_SECONDS     optional, how much of the source video to rebuild (90)
   OUT_W / OUT_H       optional output size, default 1280x720
-  YOUTUBE_COOKIES_URL GitHub link to your cookies.txt (default: the one you gave me). The bot
-                      downloads it at start and before every preview, so replacing the file
-                      on GitHub refreshes it. If the repo is PRIVATE also set GITHUB_TOKEN
-                      (token with read access to Contents).
-  YOUTUBE_COOKIES_B64 base64 of a YouTube cookies.txt (needed on Railway: YouTube blocks
-                      server IPs). Or upload cookies.txt on the dashboard instead.
+  YOUTUBE_COOKIES_URL optional GitHub link to a cookies.txt (only used by the downloader fallback).
+                      If the repo is PRIVATE also set GITHUB_TOKEN.
+  YOUTUBE_COOKIES_B64 optional base64 of a YouTube cookies.txt (downloader fallback only)
   YOUTUBE_COOKIES_FILE optional path to a cookies.txt already on disk
-  PROXY_URL           optional residential proxy (http://user:pass@host:port) used for all YouTube
-                      requests. YouTube blocks most server/datacenter IPs, a residential proxy or
-                      running the bot on your own PC (home IP) avoids that.
+  PROXY_URL           optional residential proxy (http://user:pass@host:port) for YouTube requests
   DASHBOARD_PASSWORD  optional
   PORT                optional, default 8080
 
-Needs: pip install requests yt-dlp   and ffmpeg + ffprobe installed.
+Needs: pip install requests yt-dlp edge-tts   and ffmpeg + ffprobe installed.
 
 Run the dashboard:   python faceless_bot.py
 Or one-shot from CLI: python faceless_bot.py @channelhandle 90
@@ -97,9 +88,14 @@ KREA_MODEL = os.environ.get("KREA_MODEL", "krea/krea-2/medium")
 FISH_API_KEY = os.environ.get("FISH_API_KEY", "")
 FISH_VOICE_ID = os.environ.get("FISH_VOICE_ID", "")
 FISH_MODEL = os.environ.get("FISH_MODEL", "s2-pro")
-EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-GuyNeural")
+EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AndrewNeural")
 GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Kore")
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+# Edit these right here, no env vars needed:
+USE_GEMINI_VOICE = False   # True = try Gemini's voice (tiny free daily quota) before the Microsoft voice
+ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "") or os.environ.get("ELEVEN_API_KEY", "")
+ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "pNInz6obpgDQGcFmaJgB")   # "Adam" (free-plan premade voice)
+ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
 STYLE_HINT = os.environ.get("STYLE_HINT", "").strip()
 STYLE_STRENGTH = float(os.environ.get("STYLE_STRENGTH", "0.8"))
 PREVIEW_SECONDS = int(os.environ.get("PREVIEW_SECONDS", "90"))
@@ -108,8 +104,7 @@ OUT_H = int(os.environ.get("OUT_H", "720"))
 FPS = 30
 SUB_LANGS = os.environ.get("SUB_LANGS", "en,en.*").split(",")
 YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
-YOUTUBE_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL",
-                                     "https://github.com/samgifty12345-source/bedu/blob/main/cookies%20(1).txt").strip()
+YOUTUBE_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
@@ -245,6 +240,7 @@ _nightly_tried = [False]
 def update_ytdlp(nightly=False):
     """pip-upgrade yt-dlp, then drop the old copy from memory so the next import is the new one."""
     cmd = [sys.executable, "-m", "pip", "install", "-U", "-q"] + (["--pre"] if nightly else []) + ["yt-dlp[default]"]
+    r = None
     for extra in ([], ["--break-system-packages"]):
         try:
             r = subprocess.run(cmd + extra, capture_output=True, text=True, timeout=300)
@@ -260,7 +256,7 @@ def update_ytdlp(nightly=False):
             except Exception:
                 pass
             return True
-    print(f"yt-dlp update failed: {r.stderr[-200:]}", flush=True)
+    print(f"yt-dlp update failed: {r.stderr[-200:] if r else ''}", flush=True)
     return False
 
 
@@ -524,7 +520,7 @@ def dhash(path):
 
 
 # ---------------------------------------------------------------------------
-# Claude: rewrite narration + describe frames
+# LLM: rewrite narration + describe frames
 # ---------------------------------------------------------------------------
 _gemini_state = {"no_thinking": False, "picked": False}
 
@@ -807,7 +803,7 @@ def krea_image(prompt, ref_url, dest):
 
 
 # ---------------------------------------------------------------------------
-# Fish Audio: voice-over
+# Voice-over: Fish Audio -> (Gemini, optional) -> free Microsoft voice
 # ---------------------------------------------------------------------------
 def fish_tts(text, dest):
     body = {"text": text, "format": "mp3"}
@@ -822,16 +818,35 @@ def fish_tts(text, dest):
         f.write(r.content)
 
 
+def eleven_tts(text, dest):
+    """ElevenLabs voice-over (mp3)."""
+    r = http("POST", f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}?output_format=mp3_44100_128",
+             headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
+             json={"text": text, "model_id": ELEVEN_MODEL}, timeout=180)
+    if r.status_code != 200:
+        raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:200]}")
+    with open(dest, "wb") as f:
+        f.write(r.content)
+
+
 def edge_tts_save(text, dest):
-    """Free Microsoft voice (edge-tts). Used only when Fish Audio has no API credit."""
+    """Free Microsoft voice (edge-tts). No key, no credit."""
     import asyncio
     try:
         import edge_tts
     except ImportError:
         raise RuntimeError("edge-tts isn't installed (pip install edge-tts)")
-    asyncio.run(edge_tts.Communicate(text, EDGE_VOICE).save(dest))
-    if not os.path.isfile(dest) or os.path.getsize(dest) < 500:
-        raise RuntimeError("edge-tts returned no audio")
+    last = None
+    for i in range(3):                    # the unofficial service sometimes hiccups
+        try:
+            asyncio.run(edge_tts.Communicate(text, EDGE_VOICE).save(dest))
+            if os.path.isfile(dest) and os.path.getsize(dest) >= 500:
+                return
+            last = RuntimeError("edge-tts returned no audio")
+        except Exception as e:
+            last = e
+        time.sleep(2 * (i + 1))
+    raise RuntimeError(f"edge-tts failed: {last}")
 
 
 def pick_tts_model():
@@ -843,7 +858,7 @@ def pick_tts_model():
 
 
 def gemini_tts(text, dest):
-    """Human-sounding voice from Google (free tier of your Gemini key). Returns mp3."""
+    """Human-sounding voice from Google (free tier has a tiny daily quota). Returns mp3."""
     global GEMINI_TTS_MODEL
     body = {"contents": [{"parts": [{"text": "Say in a calm, engaging narrator voice: " + text}]}],
             "generationConfig": {"responseModalities": ["AUDIO"],
@@ -880,26 +895,36 @@ def gemini_tts(text, dest):
 
 
 def make_voiceovers(texts, audios):
-    """Try the voices in order on the first line; the first that works voices the WHOLE video
-    (so the voice never changes halfway)."""
+    """Try the voices in order. The first that voices EVERY line wins. If a voice fails on the first
+    line or runs out part-way, all lines are redone with the next voice (so the voice never changes
+    halfway through the video)."""
     options = []
     if FISH_API_KEY:
         options.append(("Fish Audio", fish_tts, WORKERS))
-    if GEMINI_API_KEY:
-        options.append(("Gemini voice (free)", gemini_tts, 2))
+    if ELEVEN_API_KEY:
+        options.append(("ElevenLabs", eleven_tts, 2))
+    if GEMINI_API_KEY and USE_GEMINI_VOICE:
+        options.append(("Gemini voice (free)", gemini_tts, 1))
     options.append(("free Microsoft voice", edge_tts_save, WORKERS))
     for k, (name, fn, workers) in enumerate(options):
+        last = k == len(options) - 1
         try:
             fn(texts[0], audios[0])
         except Exception as e:
-            if k == len(options) - 1:
+            if last:
                 raise
-            why = "no API credit - add funds at fish.audio/app/developers" if "402" in str(e) else str(e)[:100]
+            why = "no API credit" if "402" in str(e) else str(e)[:100]
             status(f"⚠️ {name} unavailable ({esc(why)}). Trying the next voice ...")
             continue
         status(f"🎙️ Voice: {name}")
-        with ThreadPoolExecutor(workers) as ex:
-            list(ex.map(lambda i: fn(texts[i], audios[i]), range(1, len(texts))))
+        try:
+            with ThreadPoolExecutor(workers) as ex:
+                list(ex.map(lambda i: fn(texts[i], audios[i]), range(1, len(texts))))
+        except Exception as e:
+            if last:
+                raise
+            status(f"⚠️ {name} ran out mid-way ({esc(str(e)[:80])}). Redoing all lines with the next voice ...")
+            continue
         return name
 
 
@@ -938,7 +963,7 @@ def concat(parts, out_path, workdir):
 
 
 def check_setup():
-    missing = [n for n, v in (("KREA_API_KEY", KREA_API_KEY), ("FISH_API_KEY", FISH_API_KEY)) if not v]
+    missing = [n for n, v in (("KREA_API_KEY", KREA_API_KEY),) if not v]
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         missing.insert(0, "GEMINI_API_KEY (free at aistudio.google.com)")
     if missing:
@@ -1021,7 +1046,7 @@ def build_preview(handle, seconds=None):
         status("✍️ Rewriting the narration (same meaning, new structure) ...")
         new_text = rewrite_scenes(scenes, vid["title"])
 
-        status("🎙️ Generating voice-over with Fish Audio ...")
+        status("🎙️ Generating voice-over ...")
         audios = [os.path.join(work, f"a{i:03d}.mp3") for i in range(n)]
         voice_used = make_voiceovers(new_text, audios)
 
@@ -1050,7 +1075,7 @@ def build_preview(handle, seconds=None):
         concat(parts, final, work)
         shutil.move(final, os.path.join(OUT_DIR, "preview.mp4"))
 
-        lines = [f"SOURCE: {vid['title']}  ({vid['url']})", ""]
+        lines = [f"SOURCE: {vid['title']}  ({vid['url']})", f"VOICE: {voice_used}", ""]
         for i, (a, b, t) in enumerate(scenes):
             lines += [f"--- Scene {i + 1}  [{a:.1f}s-{b:.1f}s]  image from scene {owner[i] + 1}",
                       f"ORIGINAL : {t}", f"REWRITTEN: {new_text[i]}",
@@ -1117,7 +1142,7 @@ img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);displ
 <div class="card"><h2>1. Your animation style</h2>@@REF@@
 <input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"> <span id="upmsg" class="hint"></span>
 <div class="hint">Every redrawn frame copies the look of this image.</div></div>
-<div class="card"><h2>YouTube cookies</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
+<div class="card"><h2>YouTube cookies (only for the downloader fallback)</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
 <input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
@@ -1141,9 +1166,8 @@ def render_page():
     warns = []
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         warns.append("GEMINI_API_KEY is not set (free key at aistudio.google.com)")
-    for name, v in (("KREA_API_KEY", KREA_API_KEY), ("FISH_API_KEY", FISH_API_KEY)):
-        if not v:
-            warns.append(f"{name} is not set")
+    if not KREA_API_KEY:
+        warns.append("KREA_API_KEY is not set")
     warn = "".join(f'<div class="card warn">&#9888; {esc(w)}</div>' for w in warns)
     with status_lock:
         items = list(status_feed[-30:])
@@ -1156,14 +1180,14 @@ def render_page():
         video = (f'<div class="card"><h2>Latest preview</h2><video controls src="/out/preview.mp4?t={int(os.path.getmtime(pv))}">'
                  f'</video><div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div></div>')
     ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
-          "No cookies yet. YouTube blocks server IPs, so upload a cookies.txt exported from a logged-in browser.")
+          "No cookies. Not needed while Gemini can watch the video.")
     rep = {"@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@FEED@@": feed, "@@VIDEO@@": video,
            "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
            "@@RELOAD@@": "setTimeout(()=>location.reload(),4000);" if job_running else ""}
-    html = PAGE
+    page = PAGE
     for k, v in rep.items():
-        html = html.replace(k, v)
-    return html
+        page = page.replace(k, v)
+    return page
 
 
 class Handler(BaseHTTPRequestHandler):
