@@ -160,6 +160,7 @@ SETTING_FIELDS = [
     ("FISH_VOICE_ID", "Fish voice id (optional)", "text"),
     ("ELEVEN_API_KEY", "ElevenLabs key (optional)", "secret"),
     ("ELEVEN_VOICE_ID", "ElevenLabs voice id", "text"),
+    ("ELEVEN_MODEL", "ElevenLabs model", "text"),
     ("CF_IMAGE_URL", "Cloudflare image worker URL", "text"),
     ("CF_IMAGE_KEY", "Cloudflare worker key", "secret"),
     ("EDGE_VOICE", "Free Microsoft voice", "text"),
@@ -1138,6 +1139,11 @@ def gemini_tts(text, dest):
             pass
 
 
+def voice_sig():
+    return "|".join([str(bool(FISH_API_KEY)), FISH_VOICE_ID, str(bool(ELEVEN_API_KEY)), ELEVEN_VOICE_ID,
+                     ELEVEN_MODEL, EDGE_VOICE, str(USE_GEMINI_VOICE)])
+
+
 def make_voiceovers(texts, audios):
     """Try the voices in order. The first that voices EVERY line wins. If a voice fails on the first
     line or runs out part-way, all lines are redone with the next voice (so the voice never changes
@@ -1523,6 +1529,97 @@ def reference_data_uri():
     return _ref_uri[key]
 
 
+_mcp_model = {"set": False, "value": None}
+
+
+def _schema_enum(schema, key):
+    for d in _walk(schema or {}):
+        pr = d.get(key)
+        if isinstance(pr, dict) and isinstance(pr.get("enum"), list):
+            return [str(x) for x in pr["enum"]]
+    return []
+
+
+_krea_models_cache = {"ids": None}
+
+
+def krea_list_models(tools):
+    """Ask Krea itself which image models this login can use (its list_models tool)."""
+    if _krea_models_cache["ids"] is not None:
+        return _krea_models_cache["ids"]
+    ids = []
+    lm = _find_tool(tools, ["list_models"], exclude=())
+    if lm:
+        props = (tools[lm].get("inputSchema") or {}).get("properties") or {}
+        args = {}
+        for k in ("category", "type", "kind", "media_type", "modality"):
+            pv = props.get(k)
+            if isinstance(pv, dict):
+                en = pv.get("enum")
+                args[k] = "image" if (not en or "image" in en) else en[0]
+        for a_ in ([args, {}] if args else [{}]):
+            try:
+                data = mcp_tool(lm, a_)
+            except RuntimeError as e:
+                print(f"KREA list_models failed: {e}", flush=True)
+                continue
+            txt = json.dumps(data)
+            print(f"KREA list_models raw: {txt[:3000]}", flush=True)
+            ids = list(dict.fromkeys(re.findall(r"image/[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)+", txt)))
+            if not ids:
+                ids = list(dict.fromkeys(re.findall(r"[A-Za-z0-9_.\-]+/krea-[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*", txt)))
+            if ids:
+                break
+    _krea_models_cache["ids"] = ids
+    return ids
+
+
+def _krea_model_candidates(gen, model_key, tools):
+    """Model ids to try, best first (from the tool schema or Krea's list_models)."""
+    want = KREA_MODEL.replace("image/", "")
+    enum = _schema_enum(gen.get("inputSchema"), model_key)
+    pool = enum or krea_list_models(tools)
+    if pool:
+        def w(m):
+            return m.replace("image/", "")
+        cands = ([m for m in pool if w(m) == want]
+                 + [m for m in pool if "krea-2" in m and "medium" in m]
+                 + [m for m in pool if "krea-2" in m]
+                 + [m for m in pool if "krea" in m.lower()] + pool[:5])
+    else:
+        parts = want.split("/")
+        cands = [want, "image/" + want, parts[1] if len(parts) > 1 else want, "krea-2", None]
+    out = []
+    for m in cands:
+        if m not in out:
+            out.append(m)
+    return out, pool
+
+
+def _krea_collect(data, tools, jobtool, dest):
+    jid = _find_key(data, ["job_id", "jobId", "id"])
+    t0 = time.time()
+    while True:
+        st = str(_find_key(data, ["status"]) or "").lower()
+        if st in ("failed", "cancelled", "canceled", "error"):
+            raise RuntimeError(f"Krea job {st}: {str(data)[:200]}")
+        urls = _find_urls(_find_key(data, ["result", "output", "outputs"]) or data)
+        if urls:
+            break
+        if not jid or not jobtool:
+            raise RuntimeError(f"no image URL in Krea's reply: {str(data)[:200]}")
+        if time.time() - t0 > 300:
+            raise RuntimeError("Krea job timed out")
+        time.sleep(3)
+        jk = _pick_prop(tools.get(jobtool), ["jobId", "job_id", "id"]) or "jobId"
+        data = mcp_tool(jobtool, {jk: jid})
+    img = http("GET", urls[0], timeout=120)
+    if img.status_code != 200:
+        raise RuntimeError(f"couldn't download Krea image ({img.status_code})")
+    with open(dest, "wb") as f:
+        f.write(img.content)
+
+
 def krea_mcp_image(prompt, ref_uri, dest):
     mcp_ready()
     tools = _mcp["tools"]
@@ -1535,54 +1632,57 @@ def krea_mcp_image(prompt, ref_uri, dest):
     gen = tools[gname]
     props = (gen.get("inputSchema") or {}).get("properties") or {}
     model_key = _pick_prop(gen, ["model", "model_id", "modelId", "model_path"]) or "model"
-    box = _pick_prop(gen, ["input", "inputs", "params", "parameters", "arguments", "body"])
-    model = KREA_MODEL if KREA_MODEL.startswith(("image/", "video/")) else "image/" + KREA_MODEL
+    box = _pick_prop(gen, ["input", "inputs", "params", "parameters", "arguments", "body", "payload", "request", "options"])
+    if not box and "prompt" not in props:
+        for k_, pv_ in props.items():
+            if isinstance(pv_, dict) and pv_.get("type") == "object" and k_ != model_key:
+                box = k_
+                break
     base = {"prompt": prompt}
     if ref_uri:
         base["image_style_references"] = [{"url": ref_uri, "strength": STYLE_STRENGTH}]
     jobtool = _find_tool(tools, ["get_job", "job_status", "check_job", "job"])
+    if _mcp_model["set"]:
+        cands, enum = [_mcp_model["value"]], []
+    else:
+        cands, enum = _krea_model_candidates(gen, model_key, tools)
     err = ""
-    for vi in range(_mcp_variant[0], len(SIZE_VARIANTS)):
-        inputs = {**base, **SIZE_VARIANTS[vi]}
-        args = {}
-        if model_key in props:
-            args[model_key] = model
-        if box:
-            args[box] = inputs
-        else:
-            args.update(inputs)
-        try:
-            data = mcp_tool(gname, args)
-        except RuntimeError as e:
-            msg = str(e)
-            if any(w in msg.lower() for w in ("compute", "credit", "insufficient", "billing", "balance", "quota", "402")):
-                raise
-            err = msg
-            continue
-        _mcp_variant[0] = vi
-        jid = _find_key(data, ["job_id", "jobId", "id"])
-        t0 = time.time()
-        while True:
-            st = str(_find_key(data, ["status"]) or "").lower()
-            if st in ("failed", "cancelled", "canceled", "error"):
-                raise RuntimeError(f"Krea job {st}: {str(data)[:200]}")
-            urls = _find_urls(_find_key(data, ["result", "output", "outputs"]) or data)
-            if urls:
-                break
-            if not jid or not jobtool:
-                raise RuntimeError(f"no image URL in Krea's reply: {str(data)[:200]}")
-            if time.time() - t0 > 300:
-                raise RuntimeError("Krea job timed out")
-            time.sleep(3)
-            jk = _pick_prop(tools.get(jobtool), ["jobId", "job_id", "id"]) or "jobId"
-            data = mcp_tool(jobtool, {jk: jid})
-        img = http("GET", urls[0], timeout=120)
-        if img.status_code != 200:
-            raise RuntimeError(f"couldn't download Krea image ({img.status_code})")
-        with open(dest, "wb") as f:
-            f.write(img.content)
-        return
-    raise RuntimeError(f"Krea MCP rejected the request: {err[:300]}")
+    for model in cands:
+        model_bad = False
+        for vi in range(_mcp_variant[0], len(SIZE_VARIANTS)):
+            inputs = {**base, **SIZE_VARIANTS[vi]}
+            args = {}
+            if model:
+                if box and model_key not in props:
+                    inputs[model_key] = model
+                else:
+                    args[model_key] = model
+            if box:
+                args[box] = inputs
+            else:
+                args.update(inputs)
+            try:
+                data = mcp_tool(gname, args)
+            except RuntimeError as e:
+                msg = str(e)
+                low = msg.lower()
+                if any(w in low for w in ("compute", "credit", "insufficient", "billing", "balance", "quota", "402")):
+                    raise
+                err = msg
+                if "model" in low and any(w in low for w in ("unsupported", "invalid", "unknown", "not found", "not supported")):
+                    model_bad = True
+                    break
+                continue
+            _mcp_variant[0] = vi
+            if not _mcp_model["set"]:
+                _mcp_model.update(set=True, value=model)
+                status(f"ℹ️ Krea model in use: {esc(str(model) if model else 'Krea default')}")
+            _krea_collect(data, tools, jobtool, dest)
+            return
+        if not model_bad:
+            break
+    hint = f" Models Krea lists for you: {', '.join(enum[:30])}." if enum else ""
+    raise RuntimeError(f"Krea MCP rejected the request: {err[:300]}{hint}")
 
 
 def krea_test():
@@ -1600,6 +1700,10 @@ def krea_test():
             g = tools[gname]
             status(f"🧪 Using tool <b>{esc(gname)}</b>, inputs: "
                    + esc(json.dumps((g.get("inputSchema") or {}).get("properties") or {})[:600]))
+            en = _schema_enum(g.get("inputSchema"), _pick_prop(g, ["model", "model_id", "modelId", "model_path"]) or "model")
+            status("🧪 Allowed models: " + (esc(", ".join(en)) if en else "not listed by Krea (the bot will try several)"))
+            ids_ = krea_list_models(tools)
+            status("🧪 Models from list_models: " + (esc(", ".join(ids_[:40])) if ids_ else "none found (raw reply is in the Railway logs)"))
         else:
             status("🧪 No image-generation tool found in that list (full schemas are in the Railway logs).")
         dest = os.path.join(OUT_DIR, "krea_test.png")
@@ -1833,13 +1937,13 @@ def build_preview(handle, seconds=None, fresh=False):
         # ---- stage 4: voice-over ----
         audios = [os.path.join(jd, "audio", f"a{i:03d}.mp3") for i in range(n)]
         vo = jread(jd, "voice.json")
-        if vo and all(os.path.isfile(a) and os.path.getsize(a) > 500 for a in audios):
+        if vo and vo.get("sig", voice_sig()) == voice_sig() and all(os.path.isfile(a) and os.path.getsize(a) > 500 for a in audios):
             voice_used = vo.get("name", "")
             status(f"♻️ Reusing the saved voice-over ({esc(voice_used)}).")
         else:
             status("🎙️ Generating voice-over ...")
             voice_used = make_voiceovers(new_text, audios)
-            jwrite(jd, "voice.json", {"name": voice_used})
+            jwrite(jd, "voice.json", {"name": voice_used, "sig": voice_sig()})
 
         # ---- stage 5: images ----
         imgdir = os.path.join(jd, "images")
