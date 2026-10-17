@@ -31,7 +31,8 @@ Env vars:
   Voice order: Fish Audio -> ElevenLabs -> (Gemini voice, if USE_GEMINI_VOICE = True in the code) -> free Microsoft voice.
   If a voice fails part-way, ALL lines are redone with the next voice so the voice never changes.
   ELEVENLABS_API_KEY  ElevenLabs key (ELEVEN_VOICE_ID / ELEVEN_MODEL optional)
-  Images: Krea first; if it has no balance the bot uses your free Cloudflare Worker.
+  Images: Krea via your web credits (Connect Krea on the dashboard), then Krea API key, then the free worker.
+  Images (older note): Krea first; if it has no balance the bot uses your free Cloudflare Worker.
   Paste the worker URL into CF_IMAGE_URL near the top of this file (key defaults to 12345678).
   GEMINI_VOICE        optional Gemini voice name (default Kore)
   GEMINI_TTS_MODEL    optional, default gemini-3.1-flash-tts-preview (auto-picks a TTS model if missing)
@@ -65,6 +66,8 @@ import json
 import math
 import time
 import hmac
+import secrets
+import hashlib
 import base64
 import shutil
 import tempfile
@@ -101,6 +104,9 @@ ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
 # Free image fallback = your Cloudflare Worker. PASTE YOUR WORKER URL on the next line:
 CF_IMAGE_URL = os.environ.get("CF_IMAGE_URL", "") or "https://icon.larpwithjosh.workers.dev/"
 CF_IMAGE_KEY = os.environ.get("CF_IMAGE_KEY", "") or "12345678"   # must match the worker's API_KEY secret
+# Krea login (uses your normal Krea web credits). Tap "Connect Krea" on the dashboard once, then paste the
+# long text it shows you between the quotes below so it survives redeploys (or add a Railway volume instead).
+KREA_OAUTH_BLOB = os.environ.get("KREA_OAUTH_BLOB", "") or ""
 CF_STYLE = "flat 2D cartoon illustration, thick outlines, simple shapes, vibrant colors, no text"
 STYLE_HINT = os.environ.get("STYLE_HINT", "").strip()
 STYLE_STRENGTH = float(os.environ.get("STYLE_STRENGTH", "0.8"))
@@ -969,7 +975,7 @@ def concat(parts, out_path, workdir):
 
 
 def check_setup():
-    missing = [] if (KREA_API_KEY or CF_IMAGE_URL) else ["KREA_API_KEY or CF_IMAGE_URL"]
+    missing = [] if (KREA_API_KEY or CF_IMAGE_URL or krea_connected()) else ["KREA_API_KEY, CF_IMAGE_URL or a Krea connection"]
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         missing.insert(0, "GEMINI_API_KEY (free at aistudio.google.com)")
     if missing:
@@ -979,6 +985,388 @@ def check_setup():
             raise RuntimeError(f"{tool} is not installed")
     if not reference_path():
         status("ℹ️ No style reference image uploaded - images will use Krea's default look.")
+
+
+# ---------------------------------------------------------------------------
+# Krea through its MCP server + OAuth: spends your normal Krea web credits (not the separate API balance)
+# ---------------------------------------------------------------------------
+KREA_MCP_URL = "https://api.krea.ai/mcp"
+KREA_OAUTH_FILE = os.path.join(DATA_DIR, "krea_oauth.json")
+_oauth_lock = threading.RLock()
+_oauth_pending = {}
+_mcp = {"sid": None, "tools": None, "lock": threading.RLock(), "n": 0}
+_mcp_variant = [0]
+
+
+def oauth_load():
+    try:
+        with open(KREA_OAUTH_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        pass
+    if KREA_OAUTH_BLOB.strip():
+        try:
+            return json.loads(base64.b64decode(KREA_OAUTH_BLOB.strip()).decode())
+        except Exception:
+            return None
+    return None
+
+
+def oauth_save(d):
+    with open(KREA_OAUTH_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+
+
+def krea_connected():
+    d = oauth_load()
+    return bool(d and (d.get("refresh_token") or d.get("access_token")))
+
+
+def krea_blob():
+    d = oauth_load()
+    return base64.b64encode(json.dumps(d).encode()).decode() if d else ""
+
+
+def _json_get(url):
+    try:
+        r = requests.get(url, timeout=20, headers={"Accept": "application/json"})
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def oauth_discover():
+    pu = urllib.parse.urlparse(KREA_MCP_URL)
+    origin = f"{pu.scheme}://{pu.netloc}"
+    meta = None
+    try:                                   # the 401 answer tells us where the metadata lives
+        r = requests.post(KREA_MCP_URL, timeout=20,
+                          headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                          json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                           "clientInfo": {"name": "faceless-bot", "version": "1"}}})
+        m = re.search(r'resource_metadata="([^"]+)"', r.headers.get("WWW-Authenticate", ""))
+        if m:
+            meta = _json_get(m.group(1))
+    except Exception:
+        pass
+    if not meta:
+        for u in (origin + "/.well-known/oauth-protected-resource" + pu.path,
+                  origin + "/.well-known/oauth-protected-resource"):
+            meta = _json_get(u)
+            if meta:
+                break
+    issuer = ((meta or {}).get("authorization_servers") or [origin])[0].rstrip("/")
+    ip = urllib.parse.urlparse(issuer)
+    asm = None
+    for u in (issuer + "/.well-known/oauth-authorization-server",
+              f"{ip.scheme}://{ip.netloc}/.well-known/oauth-authorization-server{ip.path}",
+              issuer + "/.well-known/openid-configuration"):
+        asm = _json_get(u)
+        if asm and asm.get("authorization_endpoint") and asm.get("token_endpoint"):
+            break
+        asm = None
+    if not asm:
+        raise RuntimeError("couldn't find Krea's sign-in endpoints (OAuth discovery failed)")
+    return asm, (meta or {})
+
+
+def oauth_begin(base):
+    """Start the one-time Krea sign-in. Returns the Krea URL to send the browser to."""
+    asm, meta = oauth_discover()
+    redirect = base + "/krea/callback"
+    reg = asm.get("registration_endpoint")
+    if not reg:
+        raise RuntimeError("Krea doesn't offer automatic app registration for sign-in")
+    r = requests.post(reg, timeout=30, json={
+        "client_name": "Faceless Bot", "redirect_uris": [redirect],
+        "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
+        "token_endpoint_auth_method": "none"})
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"Krea app registration failed {r.status_code}: {r.text[:200]}")
+    cl = r.json()
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    _oauth_pending[state] = {"verifier": verifier, "redirect": redirect, "client_id": cl["client_id"],
+                             "client_secret": cl.get("client_secret", ""), "token_endpoint": asm["token_endpoint"]}
+    q = {"response_type": "code", "client_id": cl["client_id"], "redirect_uri": redirect,
+         "code_challenge": challenge, "code_challenge_method": "S256", "state": state, "resource": KREA_MCP_URL}
+    scopes = meta.get("scopes_supported") or asm.get("scopes_supported") or []
+    if scopes:
+        q["scope"] = " ".join(scopes)
+    sep = "&" if "?" in asm["authorization_endpoint"] else "?"
+    return asm["authorization_endpoint"] + sep + urllib.parse.urlencode(q)
+
+
+def _store_tokens(d, tok):
+    d["access_token"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        d["refresh_token"] = tok["refresh_token"]
+    d["expires_at"] = time.time() + int(tok.get("expires_in") or 3600)
+    oauth_save(d)
+
+
+def oauth_finish(code, state):
+    pend = _oauth_pending.pop(state, None)
+    if not pend:
+        raise RuntimeError("this sign-in attempt expired - tap Connect Krea again")
+    data = {"grant_type": "authorization_code", "code": code, "redirect_uri": pend["redirect"],
+            "client_id": pend["client_id"], "code_verifier": pend["verifier"], "resource": KREA_MCP_URL}
+    if pend["client_secret"]:
+        data["client_secret"] = pend["client_secret"]
+    r = requests.post(pend["token_endpoint"], data=data, headers={"Accept": "application/json"}, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Krea token exchange failed {r.status_code}: {r.text[:200]}")
+    d = {"client_id": pend["client_id"], "client_secret": pend["client_secret"],
+         "token_endpoint": pend["token_endpoint"]}
+    _store_tokens(d, r.json())
+
+
+def oauth_token(force=False):
+    with _oauth_lock:
+        d = oauth_load()
+        if not d:
+            raise RuntimeError("Krea isn't connected - tap 'Connect Krea' on the dashboard")
+        if not force and d.get("access_token") and d.get("expires_at", 0) - 60 > time.time():
+            return d["access_token"]
+        if not d.get("refresh_token"):
+            raise RuntimeError("Krea sign-in expired - tap 'Connect Krea' again")
+        data = {"grant_type": "refresh_token", "refresh_token": d["refresh_token"],
+                "client_id": d["client_id"], "resource": KREA_MCP_URL}
+        if d.get("client_secret"):
+            data["client_secret"] = d["client_secret"]
+        r = requests.post(d["token_endpoint"], data=data, headers={"Accept": "application/json"}, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f"Krea sign-in expired ({r.status_code}) - tap 'Connect Krea' again")
+        _store_tokens(d, r.json())
+        return d["access_token"]
+
+
+def _sse_pick(text, rid):
+    out = None
+    for line in text.splitlines():
+        if line.startswith("data:"):
+            try:
+                j = json.loads(line[5:].strip())
+            except ValueError:
+                continue
+            if isinstance(j, dict):
+                if j.get("id") == rid:
+                    return j
+                if out is None and ("result" in j or "error" in j):
+                    out = j
+    return out
+
+
+def mcp_rpc(method, params=None, notify=False, retry=True):
+    with _mcp["lock"]:
+        _mcp["n"] += 1
+        rid = _mcp["n"]
+    body = {"jsonrpc": "2.0", "method": method}
+    if params is not None:
+        body["params"] = params
+    if not notify:
+        body["id"] = rid
+    h = {"Authorization": f"Bearer {oauth_token()}", "Content-Type": "application/json",
+         "Accept": "application/json, text/event-stream", "MCP-Protocol-Version": "2025-06-18"}
+    if _mcp["sid"] and method != "initialize":
+        h["Mcp-Session-Id"] = _mcp["sid"]
+    r = http("POST", KREA_MCP_URL, headers=h, json=body, timeout=300, tries=3)
+    if r.status_code == 401 and retry:
+        oauth_token(force=True)
+        return mcp_rpc(method, params, notify, retry=False)
+    if r.status_code in (400, 404) and _mcp["sid"] and method != "initialize" and retry:
+        with _mcp["lock"]:                 # session expired: start a new one
+            _mcp["tools"] = None
+            _mcp["sid"] = None
+        mcp_ready()
+        return mcp_rpc(method, params, notify, retry=False)
+    if method == "initialize" and r.headers.get("Mcp-Session-Id"):
+        _mcp["sid"] = r.headers["Mcp-Session-Id"]
+    if notify:
+        return None
+    if r.status_code >= 300:
+        raise RuntimeError(f"Krea MCP {r.status_code}: {r.text[:250]}")
+    j = _sse_pick(r.text, rid) if "text/event-stream" in r.headers.get("Content-Type", "") else r.json()
+    if not isinstance(j, dict):
+        raise RuntimeError(f"Krea MCP gave an unreadable reply: {r.text[:200]}")
+    if j.get("error"):
+        raise RuntimeError(f"Krea MCP error: {str(j['error'])[:300]}")
+    return j.get("result")
+
+
+def mcp_ready():
+    with _mcp["lock"]:
+        if _mcp["tools"] is not None:
+            return
+        _mcp["sid"] = None
+        mcp_rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                               "clientInfo": {"name": "faceless-bot", "version": "1"}})
+        mcp_rpc("notifications/initialized", {}, notify=True)
+        tl = mcp_rpc("tools/list", {}) or {}
+        _mcp["tools"] = {t["name"]: t for t in tl.get("tools", [])}
+
+
+def mcp_tool(name, args):
+    mcp_ready()
+    res = mcp_rpc("tools/call", {"name": name, "arguments": args}) or {}
+    text = "".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text")
+    if res.get("isError"):
+        raise RuntimeError(f"Krea tool error: {text[:300]}")
+    data = res.get("structuredContent")
+    if data is None:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            data = {"text": text}
+    return data
+
+
+def _walk(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
+
+
+def _find_key(o, keys):
+    for d in _walk(o):
+        for k in keys:
+            if d.get(k) not in (None, ""):
+                return d[k]
+    return None
+
+
+def _find_urls(o):
+    urls = []
+    for d in _walk(o):
+        for k in ("urls", "url", "image_url", "output_url"):
+            v = d.get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                urls.append(v)
+            elif isinstance(v, list):
+                urls += [x for x in v if isinstance(x, str) and x.startswith("http")]
+    return urls
+
+
+def _pick_prop(tool, names):
+    props = ((tool or {}).get("inputSchema") or {}).get("properties") or {}
+    for n in names:
+        if n in props:
+            return n
+    return None
+
+
+_ref_uri = {}
+
+
+def reference_data_uri():
+    """Your style image, shrunk, as a data: URI (Krea accepts that as a style reference)."""
+    pth = reference_path()
+    if not pth:
+        return ""
+    key = (pth, os.path.getmtime(pth))
+    if key not in _ref_uri:
+        tmp = os.path.join(tempfile.gettempdir(), "ref_small.jpg")
+        run_ffmpeg(["ffmpeg", "-y", "-i", pth, "-vf", "scale='min(1024,iw)':-2", "-q:v", "4", tmp], "shrink reference")
+        with open(tmp, "rb") as f:
+            _ref_uri[key] = "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+    return _ref_uri[key]
+
+
+def krea_mcp_image(prompt, ref_uri, dest):
+    mcp_ready()
+    tools = _mcp["tools"]
+    gen = tools.get("generate")
+    if not gen:
+        raise RuntimeError("Krea MCP has no 'generate' tool (it offers: " + ", ".join(tools) + ")")
+    model_key = _pick_prop(gen, ["model", "model_id", "modelId", "model_path"]) or "model"
+    box = _pick_prop(gen, ["input", "inputs", "params", "parameters", "arguments", "body"])
+    model = KREA_MODEL if KREA_MODEL.startswith(("image/", "video/")) else "image/" + KREA_MODEL
+    base = {"prompt": prompt}
+    if ref_uri:
+        base["image_style_references"] = [{"url": ref_uri, "strength": STYLE_STRENGTH}]
+    err = ""
+    for vi in range(_mcp_variant[0], len(SIZE_VARIANTS)):
+        inputs = {**base, **SIZE_VARIANTS[vi]}
+        args = {model_key: model}
+        if box:
+            args[box] = inputs
+        else:
+            args.update(inputs)
+        try:
+            data = mcp_tool("generate", args)
+        except RuntimeError as e:
+            msg = str(e)
+            if any(w in msg.lower() for w in ("compute", "credit", "insufficient", "billing", "balance", "quota", "402")):
+                raise
+            err = msg
+            continue
+        _mcp_variant[0] = vi
+        jid = _find_key(data, ["job_id", "jobId", "id"])
+        t0 = time.time()
+        while True:
+            st = str(_find_key(data, ["status"]) or "").lower()
+            if st in ("failed", "cancelled", "canceled", "error"):
+                raise RuntimeError(f"Krea job {st}: {str(data)[:200]}")
+            urls = _find_urls(_find_key(data, ["result", "output", "outputs"]) or {})
+            if urls:
+                break
+            if not jid:
+                raise RuntimeError(f"couldn't read the job id from Krea's reply: {str(data)[:200]}")
+            if time.time() - t0 > 300:
+                raise RuntimeError("Krea job timed out")
+            time.sleep(3)
+            jk = _pick_prop(tools.get("get_job"), ["jobId", "job_id", "id"]) or "jobId"
+            data = mcp_tool("get_job", {jk: jid})
+        img = http("GET", urls[0], timeout=120)
+        if img.status_code != 200:
+            raise RuntimeError(f"couldn't download Krea image ({img.status_code})")
+        with open(dest, "wb") as f:
+            f.write(img.content)
+        return
+    raise RuntimeError(f"Krea MCP rejected the request: {err[:300]}")
+
+
+def krea_test():
+    try:
+        status("🧪 Testing Krea with your credits ...")
+        with _mcp["lock"]:
+            _mcp["tools"] = None
+        mcp_ready()
+        tools = _mcp["tools"]
+        status("🧪 Connected. Krea tools: " + esc(", ".join(tools) or "none"))
+        g = tools.get("generate")
+        if g:
+            status("🧪 generate inputs: " + esc(json.dumps((g.get("inputSchema") or {}).get("properties") or {})[:600]))
+        dest = os.path.join(OUT_DIR, "krea_test.png")
+        krea_mcp_image("a friendly cartoon caveman sitting by a campfire at night", reference_data_uri(), dest)
+        status('✅ Krea works with your credits: <a href="/out/krea_test.png" target="_blank">see the test image</a>')
+    except Exception as e:
+        status(f"❌ Krea test failed: {esc(str(e)[:500])}")
+
+
+def krea_card():
+    if krea_connected():
+        return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
+                '&#9989; Connected. Images use your normal Krea compute credits first.</div>'
+                '<form method="POST" action="/krea/test" style="display:inline"><button type="submit">Test it</button></form> '
+                '<form method="POST" action="/krea/disconnect" style="display:inline"><button type="submit" style="background:#26263a">Disconnect</button></form>'
+                '<details style="margin-top:12px"><summary>Keep it after redeploys</summary><div class="sb">'
+                'Paste this between the quotes of <code>KREA_OAUTH_BLOB = ""</code> near the top of the code '
+                '(or add a Railway volume at the data folder). It is a secret login, keep it private.'
+                f'<textarea readonly rows="4" style="width:100%;margin-top:8px;background:#08080d;color:#eaeaf2;border:1px solid #26263a;border-radius:8px">{esc(krea_blob())}</textarea>'
+                '</div></details></div>')
+    return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
+            'Not connected. Sign in once so the bot can spend your normal Krea credits. On the Krea screen, '
+            'pick the workspace that has the credits.</div>'
+            '<a href="/krea/connect"><button type="button">Connect Krea</button></a></div>')
 
 
 def cf_image(prompt, dest):
@@ -997,8 +1385,11 @@ def make_images(unique, prompts, imgdir):
     """Try the image providers in order. The first that draws EVERY image wins; if one fails on the
     first image or runs out part-way, all images are redone with the next one (consistent style)."""
     options = []
+    if krea_connected():
+        options.append(("Krea (your credits)", lambda pr, d: krea_mcp_image(
+            pr + (". " + STYLE_HINT if STYLE_HINT else ""), reference_data_uri(), d), WORKERS))
     if KREA_API_KEY:
-        options.append(("Krea", lambda pr, d: krea_image(pr + (". " + STYLE_HINT if STYLE_HINT else ""),
+        options.append(("Krea API", lambda pr, d: krea_image(pr + (". " + STYLE_HINT if STYLE_HINT else ""),
                                                           krea_reference_url(), d), WORKERS))
     if CF_IMAGE_URL:
         options.append(("Cloudflare AI (free)", lambda pr, d: cf_image(pr + ". " + (STYLE_HINT or CF_STYLE), d), 2))
@@ -1304,6 +1695,7 @@ summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
 <div class="hint">Krea copies the look of this image. (The free Cloudflare fallback can't use it.)</div></div>
 <div class="card"><h2>YouTube cookies (only for the downloader fallback)</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
 <input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
+@@KREA@@
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
 <input type="text" name="handle" placeholder="@channelname" required>
@@ -1436,14 +1828,14 @@ def render_page():
     warns = []
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         warns.append("GEMINI_API_KEY is not set (free key at aistudio.google.com)")
-    if not (KREA_API_KEY or CF_IMAGE_URL):
-        warns.append("No image provider: set KREA_API_KEY or paste CF_IMAGE_URL in the code")
+    if not (KREA_API_KEY or CF_IMAGE_URL or krea_connected()):
+        warns.append("No image provider: connect Krea below, set KREA_API_KEY or paste CF_IMAGE_URL in the code")
     warn = "".join(f'<div class="card warn">&#9888; {esc(w)}</div>' for w in warns)
     ref = f'<img class="ref" src="/ref?t={int(time.time())}">' if reference_path() else \
         '<div class="hint" style="margin:0 0 8px">No reference image yet.</div>'
     ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
           "No cookies. Not needed while Gemini can watch the video.")
-    rep_ = {"@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
+    rep_ = {"@@KREA@@": krea_card(), "@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
             "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
             "@@RELOAD@@": "poll();" if job_running else ""}
     page = PAGE
@@ -1471,6 +1863,12 @@ class Handler(BaseHTTPRequestHandler):
     def _deny(self):
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="Faceless Bot"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _redir(self, loc):
+        self.send_response(303)
+        self.send_header("Location", loc)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -1524,6 +1922,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b"ok")
         if not self._authorized():
             return self._deny()
+        if path == "/krea/connect":
+            try:
+                host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host", "")
+                proto = (self.headers.get("X-Forwarded-Proto") or ("http" if host.startswith(("localhost", "127.")) else "https")).split(",")[0].strip()
+                return self._redir(oauth_begin(f"{proto}://{host}"))
+            except Exception as e:
+                return self._send(500, f"Couldn't start the Krea sign-in: {e}".encode())
+        if path == "/krea/callback":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                if q.get("error"):
+                    raise RuntimeError((q.get("error_description") or q["error"])[0])
+                oauth_finish((q.get("code") or [""])[0], (q.get("state") or [""])[0])
+                status("🔑 Krea connected. Tap 'Test it' to check your credits work.")
+                return self._redir("/")
+            except Exception as e:
+                status(f"❌ Krea sign-in failed: {esc(str(e)[:300])}")
+                return self._send(500, f"Krea sign-in failed: {e}".encode())
         if path == "/":
             if "partial=1" in urllib.parse.urlparse(self.path).query:
                 body = live_html().encode()
@@ -1541,7 +1957,7 @@ class Handler(BaseHTTPRequestHandler):
             if jd and re.match(r"^(audio|images)/[\w.-]+$", rel):
                 return self._serve_file(os.path.join(jd, rel))
             return self._send(404, b"not found")
-        if path in ("/out/preview.mp4", "/out/script.txt"):
+        if path in ("/out/preview.mp4", "/out/script.txt", "/out/krea_test.png"):
             return self._serve_file(os.path.join(OUT_DIR, os.path.basename(path)))
         if path == "/ref":
             return self._serve_file(reference_path())
@@ -1585,7 +2001,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authorized():
             return self._deny()
-        if urllib.parse.urlparse(self.path).path != "/run":
+        ppath = urllib.parse.urlparse(self.path).path
+        if ppath == "/krea/test":
+            threading.Thread(target=krea_test, daemon=True).start()
+            return self._redir("/")
+        if ppath == "/krea/disconnect":
+            try:
+                os.remove(KREA_OAUTH_FILE)
+            except OSError:
+                pass
+            with _mcp["lock"]:
+                _mcp["tools"] = None
+            status("🔌 Krea disconnected.")
+            return self._redir("/")
+        if ppath != "/run":
             return self._send(404, b"not found")
         length = int(self.headers.get("Content-Length", 0))
         f = urllib.parse.parse_qs(self.rfile.read(length).decode() if length else "")
