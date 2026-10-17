@@ -18,11 +18,18 @@ What it does, step by step:
 Output: data/out/preview.mp4 + data/out/script.txt (original vs rewritten, per
 scene, so you can check the meaning really stayed the same).
 
+NEW - works fully online (no PC, no cookies, no proxy): Gemini can open a public YouTube link
+itself, so the bot asks Gemini to WATCH the video and return the scenes (what is said +
+what is on screen). YouTube never sees Railway's IP. If that fails, the bot falls back to
+yt-dlp / youtube-transcript-api (which need cookies / a non-datacenter IP).
+
 Env vars:
   GEMINI_API_KEY      Google Gemini key (FREE tier works) - rewrite + frame description
                       get one at aistudio.google.com -> Get API key
   ANTHROPIC_API_KEY   optional alternative to Gemini (paid). Gemini is used if both are set
-  GEMINI_MODEL        optional, default gemini-2.5-flash
+  GEMINI_MODEL        optional, default gemini-2.5-flash (if Google removed it, the bot
+                      automatically picks the newest Gemini Flash model)
+  WATCH_WITH_GEMINI   optional, set to 0 to skip the Gemini 'watch' step
   KREA_API_KEY        Krea API token (krea.ai/settings/api-tokens)
   FISH_API_KEY        Fish Audio key
   FISH_VOICE_ID       optional, your Fish voice model id (default voice if empty)
@@ -41,6 +48,9 @@ Env vars:
   YOUTUBE_COOKIES_B64 base64 of a YouTube cookies.txt (needed on Railway: YouTube blocks
                       server IPs). Or upload cookies.txt on the dashboard instead.
   YOUTUBE_COOKIES_FILE optional path to a cookies.txt already on disk
+  PROXY_URL           optional residential proxy (http://user:pass@host:port) used for all YouTube
+                      requests. YouTube blocks most server/datacenter IPs, a residential proxy or
+                      running the bot on your own PC (home IP) avoids that.
   DASHBOARD_PASSWORD  optional
   PORT                optional, default 8080
 
@@ -93,6 +103,7 @@ YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
 YOUTUBE_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL",
                                      "https://github.com/samgifty12345-source/bedu/blob/main/cookies%20(1).txt").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
 
@@ -129,6 +140,8 @@ def esc(s):
 def http(method, url, tries=3, **kw):
     """requests with a few retries on rate limits / server errors."""
     kw.setdefault("timeout", 120)
+    if PROXY_URL and "youtube.com" in url:
+        kw.setdefault("proxies", {"http": PROXY_URL, "https": PROXY_URL})
     last = None
     for i in range(tries):
         try:
@@ -243,9 +256,22 @@ def update_ytdlp(nightly=False):
     return False
 
 
+def pip_install(pkg):
+    for extra in ([], ["--break-system-packages"]):
+        try:
+            r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "-q", pkg] + extra,
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            return False
+    return False
+
+
 def startup_update():
     try:
         update_ytdlp(False)
+        pip_install("youtube-transcript-api")
     finally:
         ytdlp_ready.set()
 
@@ -273,6 +299,8 @@ def cookies_path():
 
 def ydl_opts(cookies=True, **extra):
     o = {"quiet": True, "no_warnings": True}
+    if PROXY_URL:
+        o["proxy"] = PROXY_URL
     cp = cookies_path() if cookies else ""
     if cp:
         o["extractor_args"] = {"youtubetab": {"skip": ["authcheck"]}}   # = --extractor-args youtubetab:skip=authcheck
@@ -327,9 +355,15 @@ def latest_via_rss(handle):
 
 
 def latest_video(handle):
-    import yt_dlp
     last = None
-    for use_cookies in (False, True):     # the channel page often works better without cookies
+    try:                                  # public RSS feed: fast and not blocked on servers
+        v = latest_via_rss(handle)
+        if v:
+            return v
+    except Exception as e:
+        last = e
+    import yt_dlp
+    for use_cookies in (False, True):     # backup: the channel page
         try:
             with yt_dlp.YoutubeDL(ydl_opts(cookies=use_cookies, extract_flat=True, playlistend=3)) as y:
                 info = y.extract_info(channel_url(handle), download=False)
@@ -339,12 +373,6 @@ def latest_video(handle):
                         "url": f"https://www.youtube.com/watch?v={v['id']}"}
         except Exception as e:
             last = e
-    try:
-        v = latest_via_rss(handle)
-        if v:
-            return v
-    except Exception as e:
-        last = last or e
     raise last or RuntimeError("couldn't find any videos on that channel")
 
 
@@ -365,7 +393,41 @@ def parse_json3(path):
     return cues
 
 
+def subtitles_via_transcript_api(video_id):
+    """Second way to get captions: the youtube-transcript-api package (also needs a non-datacenter IP)."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except ImportError:
+        raise RuntimeError("youtube-transcript-api is not installed")
+    kw = {}
+    if PROXY_URL:
+        from youtube_transcript_api.proxies import GenericProxyConfig
+        kw["proxy_config"] = GenericProxyConfig(http_url=PROXY_URL, https_url=PROXY_URL)
+    langs = [l for l in SUB_LANGS if ".*" not in l] or ["en"]
+    cues, prev = [], ""
+    for sn in YouTubeTranscriptApi(**kw).fetch(video_id, languages=langs):
+        txt = re.sub(r"\s+", " ", sn.text.replace("\n", " ")).strip()
+        if txt and txt != prev:
+            prev = txt
+            cues.append((sn.start, sn.start + sn.duration, txt))
+    if not cues:
+        raise RuntimeError("no captions returned")
+    return cues
+
+
 def get_subtitles(video_url, tmp):
+    try:
+        return get_subtitles_ytdlp(video_url, tmp)
+    except Exception as e1:
+        vid = (urllib.parse.parse_qs(urllib.parse.urlparse(video_url).query).get("v") or [""])[0]
+        status("📝 yt-dlp couldn't get the subtitles, trying youtube-transcript-api ...")
+        try:
+            return subtitles_via_transcript_api(vid)
+        except Exception as e2:
+            raise RuntimeError(f"couldn't get subtitles. yt-dlp: {str(e1)[:150]} | transcript-api: {str(e2)[:150]}")
+
+
+def get_subtitles_ytdlp(video_url, tmp):
     import yt_dlp
     opts = ydl_opts(skip_download=True, writesubtitles=True, writeautomaticsub=True,
                     subtitleslangs=SUB_LANGS, subtitlesformat="json3",
@@ -455,6 +517,63 @@ def dhash(path):
 # ---------------------------------------------------------------------------
 # Claude: rewrite narration + describe frames
 # ---------------------------------------------------------------------------
+_gemini_state = {"no_thinking": False, "picked": False}
+
+
+def pick_gemini_model():
+    """Newest plain 'gemini-X-flash' model this key can use."""
+    r = http("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+             headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+    best = None
+    for m in (r.json().get("models", []) if r.status_code == 200 else []):
+        name = m.get("name", "").split("/")[-1]
+        mm = re.match(r"^gemini-(\d+(?:\.\d+)?)-flash$", name)
+        if mm and "generateContent" in m.get("supportedGenerationMethods", []):
+            v = float(mm.group(1))
+            if best is None or v > best[0]:
+                best = (v, name)
+    return best[1] if best else None
+
+
+def gemini_call(system, parts, max_tokens=4000, json_mode=False, temperature=0.7, timeout=180):
+    """One Gemini generateContent call. Handles a removed model name and thinking-config differences."""
+    global GEMINI_MODEL
+    r = None
+    for _ in range(4):
+        cfg = {"maxOutputTokens": max_tokens, "temperature": temperature}
+        if json_mode:
+            cfg["responseMimeType"] = "application/json"
+        if "flash" in GEMINI_MODEL and not _gemini_state["no_thinking"]:
+            cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no hidden thinking tokens
+        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                 json=body, timeout=timeout, tries=5)
+        if r.status_code == 404 and not _gemini_state["picked"]:
+            _gemini_state["picked"] = True
+            newm = pick_gemini_model()
+            if newm and newm != GEMINI_MODEL:
+                status(f"ℹ️ Gemini model {esc(GEMINI_MODEL)} isn't available, switching to {esc(newm)}.")
+                GEMINI_MODEL = newm
+                continue
+        if r.status_code == 400 and "thinking" in r.text.lower() and not _gemini_state["no_thinking"]:
+            _gemini_state["no_thinking"] = True
+            continue
+        break
+    if r.status_code != 200:
+        raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:250]}")
+    j = r.json()
+    cands = j.get("candidates") or []
+    if not cands:
+        raise RuntimeError(f"Gemini returned nothing: {str(j.get('promptFeedback', j))[:200]}")
+    out = "".join(p.get("text", "") for p in (cands[0].get("content") or {}).get("parts", [])).strip()
+    if not out:
+        raise RuntimeError(f"Gemini returned empty text (finish: {cands[0].get('finishReason')})")
+    return out
+
+
 def llm(system, text, max_tokens=4000, image_b64=None):
     """One text (optionally + one JPEG image) in, text out. Uses Gemini (free tier ok)
     if GEMINI_API_KEY is set, otherwise Anthropic."""
@@ -462,24 +581,7 @@ def llm(system, text, max_tokens=4000, image_b64=None):
         parts = [{"text": text}]
         if image_b64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
-        cfg = {"maxOutputTokens": max_tokens, "temperature": 0.7}
-        if "flash" in GEMINI_MODEL:
-            cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no hidden thinking tokens
-        r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                 json={"systemInstruction": {"parts": [{"text": system}]},
-                       "contents": [{"role": "user", "parts": parts}], "generationConfig": cfg},
-                 timeout=180, tries=5)
-        if r.status_code != 200:
-            raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:200]}")
-        j = r.json()
-        cands = j.get("candidates") or []
-        if not cands:
-            raise RuntimeError(f"Gemini returned nothing: {str(j.get('promptFeedback', j))[:200]}")
-        out = "".join(p.get("text", "") for p in (cands[0].get("content") or {}).get("parts", [])).strip()
-        if not out:
-            raise RuntimeError(f"Gemini returned empty text (finish: {cands[0].get('finishReason')})")
-        return out
+        return gemini_call(system, parts, max_tokens)
     content = [{"type": "text", "text": text}]
     if image_b64:
         content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}})
@@ -491,6 +593,76 @@ def llm(system, text, max_tokens=4000, image_b64=None):
     if r.status_code != 200:
         raise RuntimeError(f"Claude API {r.status_code}: {r.text[:200]}")
     return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+
+
+WATCH_PROMPT = """Watch this video from the start. Split the first {N} seconds into scenes: begin a new scene whenever
+the picture clearly changes (new image, new shot, new diagram, new background). Each scene should last
+3 to 10 seconds (split longer shots, merge very short ones).
+
+For every scene return:
+- "start" and "end": seconds from the start of the video (numbers)
+- "narration": the words spoken during the scene, transcribed exactly, plain text ("" if nobody speaks)
+- "visual": ONE image-generation prompt (max 70 words) that recreates what is on screen as an animated
+  illustration: main subject(s), pose and position, camera angle, setting, key objects, mood, colors.
+  Do NOT name an art style, include no readable text or lettering, and describe people generically.
+- "same_as_previous": true only if the picture is essentially unchanged from the previous scene.
+
+Return ONLY a JSON list, for example:
+[{"start":0,"end":6.5,"narration":"...","visual":"...","same_as_previous":false}]"""
+
+
+def _secs(v):
+    if isinstance(v, (int, float)):
+        return float(v)
+    v = str(v).strip().rstrip("s")
+    if ":" in v:
+        out = 0.0
+        for part in v.split(":"):
+            out = out * 60 + float(part)
+        return out
+    return float(v)
+
+
+def gemini_watch(video_url, seconds):
+    """Let Gemini open the YouTube link itself and describe the first `seconds`.
+    Returns (scenes[[start,end,text]], visuals[prompt], owner[image index per scene])."""
+    parts = [{"file_data": {"file_uri": video_url},
+              "video_metadata": {"start_offset": "0s", "end_offset": f"{int(seconds)}s"}},
+             {"text": WATCH_PROMPT.replace("{N}", str(int(seconds)))}]
+    raw = gemini_call("", parts, max_tokens=16000, json_mode=True, temperature=0.3, timeout=600)
+    items = parse_json_list(raw)
+    scenes, visuals, same = [], [], []
+    for it in items:
+        try:
+            a, b = _secs(it["start"]), _secs(it["end"])
+        except (KeyError, ValueError):
+            continue
+        if a >= seconds or b <= a:
+            continue
+        text = re.sub(r"\s+", " ", str(it.get("narration") or "")).strip()
+        vis = str(it.get("visual") or "").strip()
+        if not text and scenes:                        # silent stretch joins the previous scene
+            scenes[-1][1] = b
+            continue
+        if not text:                                   # silent start: carry its timing into the next scene
+            scenes.append([a, b, ""])
+        else:
+            scenes.append([a, b, text])
+        visuals.append(vis)
+        same.append(bool(it.get("same_as_previous")))
+    if len(scenes) > 1 and not scenes[0][2]:
+        scenes[1][0] = scenes[0][0]
+        scenes.pop(0), visuals.pop(0), same.pop(0)
+    keep = [i for i, sc in enumerate(scenes) if sc[2] and visuals[i]]
+    if not keep:
+        raise RuntimeError("Gemini didn't return usable scenes")
+    scenes = [scenes[i] for i in keep]
+    visuals = [visuals[i] for i in keep]
+    same = [same[i] for i in keep]
+    owner = []
+    for i in range(len(scenes)):
+        owner.append(owner[i - 1] if i > 0 and same[i] else i)
+    return scenes, visuals, owner
 
 
 REWRITE_SYSTEM = """You rewrite spoken video narration.
@@ -538,7 +710,16 @@ def rewrite_scenes(scenes, title):
     return [new.get(i) or scenes[i][2] for i in range(len(scenes))]
 
 
+DESCRIBE_TEXT_SYSTEM = """You write image-generation prompts.
+You get the narration of one scene from an explainer video. Write ONE prompt (max 70 words) for an animated
+illustration that shows what the narration is about: main subject(s), pose and position, setting, key objects,
+mood and colors. No text or lettering in the image. Do NOT name the art style (a style reference image
+supplies it). Do not name real people; use generic characters. Output ONLY the prompt."""
+
+
 def describe_frame(frame_path, narration):
+    if not frame_path:     # couldn't watch the video: draw from the narration alone
+        return llm(DESCRIBE_TEXT_SYSTEM, f"Narration: {narration[:500]}", 300)
     with open(frame_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
     return llm(DESCRIBE_SYSTEM, f"Narration for this scene: {narration[:400]}", 300, image_b64=b64)
@@ -681,7 +862,6 @@ def check_setup():
 
 def build_preview(handle, seconds=None):
     check_setup()
-    fetch_cookies_from_github()
     seconds = max(20, int(seconds or PREVIEW_SECONDS))
     work = tempfile.mkdtemp(prefix="fl_")
     try:
@@ -689,33 +869,64 @@ def build_preview(handle, seconds=None):
         vid = yt_call(latest_video, handle)
         status(f"📺 Latest video: {esc(vid['title'][:90])}")
 
-        status("📝 Getting subtitles ...")
-        cues = yt_call(get_subtitles, vid["url"], work)
-        status(f"📝 {len(cues)} subtitle lines")
+        scenes = visuals = owner = frames = None
+        if GEMINI_API_KEY and os.environ.get("WATCH_WITH_GEMINI", "1") != "0":
+            status("👀 Asking Gemini to watch the video (it opens the YouTube link itself - no download needed) ...")
+            try:
+                scenes, visuals, owner = gemini_watch(vid["url"], seconds)
+                n = len(scenes)
+                frames = [None] * n
+                unique = sorted(set(owner))
+                status(f"🎬 Gemini watched it: {n} scenes, {len(unique)} different looks")
+            except Exception as e:
+                print(f"Gemini watch failed: {e}", flush=True)
+                scenes = None
+                status(f"⚠️ Gemini couldn't watch it ({esc(str(e)[:200])}). Trying the downloader instead ...")
 
-        status(f"⬇️ Downloading the first {seconds}s to watch it ...")
-        src = yt_call(download_clip, vid["url"], work, seconds)
-        total = min(duration(src), seconds)
+        if scenes is None:
+            fetch_cookies_from_github()
+            status("📝 Getting subtitles ...")
+            cues = yt_call(get_subtitles, vid["url"], work)
+            status(f"📝 {len(cues)} subtitle lines")
 
-        status("👀 Watching the video and finding scene changes ...")
-        scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
-        if not scenes:
-            raise RuntimeError("no spoken lines found in that stretch of the video")
-        n = len(scenes)
+            status(f"⬇️ Downloading the first {seconds}s to watch it ...")
+            src = None
+            try:
+                src = yt_call(download_clip, vid["url"], work, seconds)
+            except Exception as e:
+                print(f"Video download failed: {e}", flush=True)
+                status("⚠️ YouTube blocked the video download, so the bot can't watch it. "
+                       "Building from the script only (images are drawn from the narration, not the original frames).")
 
-        # one frame per scene; scenes that look the same as the previous one reuse its image
-        frames, owner, hashes = [], [], []
-        for i, (a, b, _) in enumerate(scenes):
-            fp = os.path.join(work, f"f{i:03d}.jpg")
-            grab_frame(src, (a + b) / 2, fp)
-            frames.append(fp)
-            h = dhash(fp)
-            same = (i > 0 and h is not None and hashes[i - 1] is not None
-                    and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
-            hashes.append(h)
-            owner.append(owner[i - 1] if same else i)
-        unique = sorted(set(owner))
-        status(f"🎬 {n} scenes, {len(unique)} different looks (reusing images when the video didn't change)")
+            if src:
+                total = min(duration(src), seconds)
+                status("👀 Watching the video and finding scene changes ...")
+                scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
+            else:
+                total = min(float(seconds), max([b for _, b, _ in cues] + [0.0]))
+                scenes = attach_text(build_scenes([], total), cues)
+            if not scenes:
+                raise RuntimeError("no spoken lines found in that stretch of the video")
+            n = len(scenes)
+
+            # one frame per scene; scenes that look the same as the previous one reuse its image
+            frames, owner, hashes = [], [], []
+            for i, (a, b, _) in enumerate(scenes):
+                if not src:
+                    frames.append(None)
+                    owner.append(i)
+                    continue
+                fp = os.path.join(work, f"f{i:03d}.jpg")
+                grab_frame(src, (a + b) / 2, fp)
+                frames.append(fp)
+                h = dhash(fp)
+                same = (i > 0 and h is not None and hashes[i - 1] is not None
+                        and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
+                hashes.append(h)
+                owner.append(owner[i - 1] if same else i)
+            unique = sorted(set(owner))
+            status(f"🎬 {n} scenes, {len(unique)} different looks"
+                   + (" (reusing images when the video didn't change)" if src else ""))
 
         status("✍️ Rewriting the narration (same meaning, new structure) ...")
         new_text = rewrite_scenes(scenes, vid["title"])
@@ -730,7 +941,7 @@ def build_preview(handle, seconds=None):
         images, prompts = {}, {}
 
         def make_image(i):
-            p = describe_frame(frames[i], scenes[i][2])
+            p = visuals[i] if visuals else describe_frame(frames[i], scenes[i][2])
             if STYLE_HINT:
                 p += ". " + STYLE_HINT
             dest = os.path.join(work, f"img{i:03d}.png")
