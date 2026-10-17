@@ -215,6 +215,54 @@ def fetch_cookies_from_github():
                + (" - using the last saved copy." if cookies_path() else ""))
 
 
+# --- keep yt-dlp up to date (YouTube changes break old versions, e.g. "The page needs to be reloaded") ---
+ytdlp_ready = threading.Event()
+_nightly_tried = [False]
+
+
+def update_ytdlp(nightly=False):
+    """pip-upgrade yt-dlp, then drop the old copy from memory so the next import is the new one."""
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "-q"] + (["--pre"] if nightly else []) + ["yt-dlp[default]"]
+    for extra in ([], ["--break-system-packages"]):
+        try:
+            r = subprocess.run(cmd + extra, capture_output=True, text=True, timeout=300)
+        except Exception as e:
+            print(f"yt-dlp update error: {e}", flush=True)
+            return False
+        if r.returncode == 0:
+            for m in [m for m in sys.modules if m == "yt_dlp" or m.startswith("yt_dlp.")]:
+                del sys.modules[m]
+            try:
+                import yt_dlp
+                print(f"yt-dlp is now {yt_dlp.version.__version__}", flush=True)
+            except Exception:
+                pass
+            return True
+    print(f"yt-dlp update failed: {r.stderr[-200:]}", flush=True)
+    return False
+
+
+def startup_update():
+    try:
+        update_ytdlp(False)
+    finally:
+        ytdlp_ready.set()
+
+
+def yt_call(fn, *args):
+    """Run a yt-dlp step; if YouTube says 'page needs to be reloaded', upgrade to the newest yt-dlp once and retry."""
+    ytdlp_ready.wait(timeout=300)
+    try:
+        return fn(*args)
+    except Exception as e:
+        if "needs to be reloaded" in str(e) and not _nightly_tried[0]:
+            _nightly_tried[0] = True
+            status("🔄 YouTube changed something - upgrading yt-dlp and retrying ...")
+            if update_ytdlp(True):
+                return fn(*args)
+        raise
+
+
 def cookies_path():
     for p in (YOUTUBE_COOKIES_FILE, COOKIES_SAVED):
         if p and os.path.isfile(p):
@@ -609,15 +657,15 @@ def build_preview(handle, seconds=None):
     work = tempfile.mkdtemp(prefix="fl_")
     try:
         status(f"🔎 Looking up the latest video on {esc(handle)} ...")
-        vid = latest_video(handle)
+        vid = yt_call(latest_video, handle)
         status(f"📺 Latest video: {esc(vid['title'][:90])}")
 
         status("📝 Getting subtitles ...")
-        cues = get_subtitles(vid["url"], work)
+        cues = yt_call(get_subtitles, vid["url"], work)
         status(f"📝 {len(cues)} subtitle lines")
 
         status(f"⬇️ Downloading the first {seconds}s to watch it ...")
-        src = download_clip(vid["url"], work, seconds)
+        src = yt_call(download_clip, vid["url"], work, seconds)
         total = min(duration(src), seconds)
 
         status("👀 Watching the video and finding scene changes ...")
@@ -928,11 +976,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if len(sys.argv) > 1:                       # CLI mode
         load_cookies_env()
+        startup_update()
         out = build_preview(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
         print("Done:", out)
         return
     port = int(os.environ.get("PORT", 8080))
     load_cookies_env()
+    threading.Thread(target=startup_update, daemon=True).start()
     threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever, daemon=True).start()
     print(f"Faceless bot dashboard on port {port}", flush=True)
     while True:
