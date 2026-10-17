@@ -7,8 +7,8 @@ What it does, step by step:
      scenes: what is said + what is on screen. Fallback: yt-dlp subtitles + scene detection.
   4. The AI rewrites the narration of every scene: new sentence structure,
      same meaning (facts, numbers, order of ideas all kept).
-  5. Voice-over is generated for each scene (Fish Audio -> Microsoft free voice;
-     Gemini voice only if USE_GEMINI_VOICE=1).
+  5. Voice-over is generated for each scene (Fish Audio -> ElevenLabs -> Microsoft free voice;
+     Gemini voice only if enabled in Settings).
   6. Krea redraws each scene in YOUR animation style (your reference image).
      If the next scene looks the same as the previous one, the image is reused.
   7. Every image gets a slow zoom / pan that lasts exactly as long as that
@@ -17,7 +17,21 @@ What it does, step by step:
 Output: data/out/preview.mp4 + data/out/script.txt (original vs rewritten, per
 scene, so you can check the meaning really stayed the same).
 
-Env vars:
+PERSISTENCE (so nothing you enter is lost on a Railway redeploy)
+  Everything you enter on the dashboard (Settings card, last channel, style image, cookies,
+  Krea login) is saved to the data folder. Railway wipes that folder on every deploy unless
+  you do ONE of these:
+    A) Add a Railway Volume (service -> Settings -> Volumes -> mount path /data).
+       Railway sets RAILWAY_VOLUME_MOUNT_PATH automatically and the bot uses it. Done.
+    B) No volume: set BACKUP_REPO=youruser/yourprivaterepo and GITHUB_TOKEN (a token with
+       "Contents: read & write" on that repo). The bot copies your saved files into that repo
+       and restores them on start. The repo MUST be private (it holds your keys).
+  You can use both. The local copy wins when it exists.
+  BACKUP_BRANCH   optional, default main
+  BACKUP_TOKEN    optional, use instead of GITHUB_TOKEN
+  DATA_DIR        optional, overrides the data folder
+
+Env vars (all of these can ALSO be typed into the dashboard Settings card, which wins over env):
   GEMINI_API_KEY      Google Gemini key (FREE tier works) - watch + rewrite + frame description
                       get one at aistudio.google.com -> Get API key
   ANTHROPIC_API_KEY   optional alternative to Gemini (paid). Gemini is used if both are set
@@ -25,15 +39,14 @@ Env vars:
                       automatically picks the newest Gemini Flash model)
   WATCH_WITH_GEMINI   optional, set to 0 to skip the Gemini 'watch' step
   KREA_API_KEY        Krea API token (krea.ai/settings/api-tokens)
-  FISH_API_KEY        Fish Audio key (optional now - skipped automatically if it has no credit)
+  FISH_API_KEY        Fish Audio key (optional - skipped automatically if it has no credit)
   FISH_VOICE_ID       optional, your Fish voice model id (default voice if empty)
   FISH_MODEL          optional, default s2-pro
-  Voice order: Fish Audio -> ElevenLabs -> (Gemini voice, if USE_GEMINI_VOICE = True in the code) -> free Microsoft voice.
-  If a voice fails part-way, ALL lines are redone with the next voice so the voice never changes.
   ELEVENLABS_API_KEY  ElevenLabs key (ELEVEN_VOICE_ID / ELEVEN_MODEL optional)
+  Voice order: Fish Audio -> ElevenLabs -> (Gemini voice, if enabled) -> free Microsoft voice.
+  If a voice fails part-way, ALL lines are redone with the next voice so the voice never changes.
   Images: Krea via your web credits (Connect Krea on the dashboard), then Krea API key, then the free worker.
-  Images (older note): Krea first; if it has no balance the bot uses your free Cloudflare Worker.
-  Paste the worker URL into CF_IMAGE_URL near the top of this file (key defaults to 12345678).
+  CF_IMAGE_URL        your free Cloudflare Worker URL (CF_IMAGE_KEY defaults to 12345678)
   GEMINI_VOICE        optional Gemini voice name (default Kore)
   GEMINI_TTS_MODEL    optional, default gemini-3.1-flash-tts-preview (auto-picks a TTS model if missing)
   EDGE_VOICE          free Microsoft voice (default en-US-AndrewNeural; others: en-US-BrianNeural,
@@ -50,7 +63,7 @@ Env vars:
   YOUTUBE_COOKIES_B64 optional base64 of a YouTube cookies.txt (downloader fallback only)
   YOUTUBE_COOKIES_FILE optional path to a cookies.txt already on disk
   PROXY_URL           optional residential proxy (http://user:pass@host:port) for YouTube requests
-  DASHBOARD_PASSWORD  optional
+  DASHBOARD_PASSWORD  optional (strongly recommended: the dashboard holds your keys)
   PORT                optional, default 8080
 
 Needs: pip install requests yt-dlp edge-tts   and ffmpeg + ffprobe installed.
@@ -81,7 +94,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import requests
 
 # ---------------------------------------------------------------------------
-# Settings
+# Settings (defaults come from env vars; the dashboard Settings card overrides them)
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -96,16 +109,14 @@ FISH_MODEL = os.environ.get("FISH_MODEL", "s2-pro")
 EDGE_VOICE = os.environ.get("EDGE_VOICE", "en-US-AndrewNeural")
 GEMINI_VOICE = os.environ.get("GEMINI_VOICE", "Kore")
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
-# Edit these right here, no env vars needed:
-USE_GEMINI_VOICE = False   # True = try Gemini's voice (tiny free daily quota) before the Microsoft voice
+USE_GEMINI_VOICE = os.environ.get("USE_GEMINI_VOICE", "0").lower() in ("1", "true", "yes")   # tiny free daily quota
 ELEVEN_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "") or os.environ.get("ELEVEN_API_KEY", "")
 ELEVEN_VOICE_ID = os.environ.get("ELEVEN_VOICE_ID", "pNInz6obpgDQGcFmaJgB")   # "Adam" (free-plan premade voice)
 ELEVEN_MODEL = os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2")
-# Free image fallback = your Cloudflare Worker. PASTE YOUR WORKER URL on the next line:
+# Free image fallback = your Cloudflare Worker.
 CF_IMAGE_URL = os.environ.get("CF_IMAGE_URL", "") or "https://icon.larpwithjosh.workers.dev/"
 CF_IMAGE_KEY = os.environ.get("CF_IMAGE_KEY", "") or "12345678"   # must match the worker's API_KEY secret
-# Krea login (uses your normal Krea web credits). Tap "Connect Krea" on the dashboard once, then paste the
-# long text it shows you between the quotes below so it survives redeploys (or add a Railway volume instead).
+# Optional fallback for the Krea login if you have no volume and no backup repo (the dashboard shows it).
 KREA_OAUTH_BLOB = os.environ.get("KREA_OAUTH_BLOB", "") or ""
 CF_STYLE = "flat 2D cartoon illustration, thick outlines, simple shapes, vibrant colors, no text"
 STYLE_HINT = os.environ.get("STYLE_HINT", "").strip()
@@ -122,16 +133,43 @@ PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
 
+BACKUP_REPO = os.environ.get("BACKUP_REPO", "").strip().strip("/")
+BACKUP_BRANCH = os.environ.get("BACKUP_BRANCH", "main").strip() or "main"
+BACKUP_TOKEN = os.environ.get("BACKUP_TOKEN", "").strip() or GITHUB_TOKEN
+BACKUP_PATH = "faceless-bot-data"
+
 SCENE_THRESHOLD = 0.30   # lower = more scene cuts
 MIN_SCENE = 3.0          # seconds, shorter scenes are merged
 MAX_SCENE = 10.0         # seconds, longer scenes are split
 SAME_IMAGE_BITS = 6      # frames this similar share one generated image
 WORKERS = 3              # parallel API calls
 
-DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# Data folder: explicit DATA_DIR > Railway volume > ./data
+DATA_DIR = (os.environ.get("DATA_DIR") or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 OUT_DIR = os.path.join(DATA_DIR, "out")
 os.makedirs(OUT_DIR, exist_ok=True)
 REF_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+# Fields editable on the dashboard (saved in data/settings.json). (name, label, kind)
+SETTING_FIELDS = [
+    ("GEMINI_API_KEY", "Gemini API key", "secret"),
+    ("ANTHROPIC_API_KEY", "Anthropic API key (optional)", "secret"),
+    ("KREA_API_KEY", "Krea API key (optional)", "secret"),
+    ("FISH_API_KEY", "Fish Audio key (optional)", "secret"),
+    ("FISH_VOICE_ID", "Fish voice id (optional)", "text"),
+    ("ELEVEN_API_KEY", "ElevenLabs key (optional)", "secret"),
+    ("ELEVEN_VOICE_ID", "ElevenLabs voice id", "text"),
+    ("CF_IMAGE_URL", "Cloudflare image worker URL", "text"),
+    ("CF_IMAGE_KEY", "Cloudflare worker key", "secret"),
+    ("EDGE_VOICE", "Free Microsoft voice", "text"),
+    ("STYLE_HINT", "Style hint added to every image prompt", "text"),
+    ("STYLE_STRENGTH", "Style strength (0 to 1)", "float"),
+    ("PREVIEW_SECONDS", "Default seconds to rebuild", "int"),
+    ("USE_GEMINI_VOICE", "Try the Gemini voice before the free Microsoft voice", "bool"),
+]
+ENV_DEFAULTS = {k: globals()[k] for k, _, _ in SETTING_FIELDS}
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 # ---------------------------------------------------------------------------
 # Logging / helpers
@@ -196,6 +234,200 @@ def reference_path():
         if os.path.isfile(p):
             return p
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Persistence: settings.json + optional GitHub backup (for Railway without a volume)
+# ---------------------------------------------------------------------------
+_settings_lock = threading.RLock()
+_backup_lock = threading.Lock()
+
+
+def _convert(kind, v):
+    if kind == "int":
+        return int(float(v))
+    if kind == "float":
+        return float(v)
+    if kind == "bool":
+        return str(v).lower() in ("1", "true", "yes", "on")
+    return str(v).strip()
+
+
+def settings_load():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def apply_settings(d=None):
+    """Put saved settings over the env defaults (an empty/removed setting falls back to the env value)."""
+    d = settings_load() if d is None else d
+    for key, _, kind in SETTING_FIELDS:
+        val = ENV_DEFAULTS[key]
+        if d.get(key) not in (None, ""):
+            try:
+                val = _convert(kind, d[key])
+            except (ValueError, TypeError):
+                pass
+        globals()[key] = val
+
+
+def settings_update(changes):
+    """changes: {name: value}; None or '' removes the saved value."""
+    with _settings_lock:
+        d = settings_load()
+        for k, v in changes.items():
+            if v is None or v == "":
+                d.pop(k, None)
+            else:
+                d[k] = v
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+        os.replace(tmp, SETTINGS_FILE)
+        apply_settings(d)
+    backup_file(SETTINGS_FILE)
+
+
+def settings_from_form(f):
+    ch = {}
+    for key, _, kind in SETTING_FIELDS:
+        if kind == "bool":
+            ch[key] = "1" if key in f else "0"
+            continue
+        v = (f.get(key) or [""])[0].strip()
+        if kind == "secret":
+            if v == "":
+                continue                      # blank = keep what is saved
+            if v == "-":
+                ch[key] = None                # "-" = clear it
+                continue
+        elif kind in ("int", "float") and v:
+            try:
+                _convert(kind, v)
+            except ValueError:
+                continue
+        ch[key] = v
+    settings_update(ch)
+
+
+def backup_on():
+    return bool(BACKUP_REPO and BACKUP_TOKEN)
+
+
+def _gh(method, path, accept="application/vnd.github+json", **kw):
+    return http(method, f"https://api.github.com/repos/{BACKUP_REPO}/contents/{path}",
+                headers={"Authorization": f"Bearer {BACKUP_TOKEN}", "Accept": accept,
+                         "X-GitHub-Api-Version": "2022-11-28"}, timeout=60, **kw)
+
+
+def _backup_ok(name):
+    return bool(re.match(r"^(settings\.json|krea_oauth\.json|youtube_cookies\.txt|reference\.(png|jpe?g|webp))$", name))
+
+
+def backup_file(path):
+    """Copy one saved file into the private backup repo (background, skipped if unchanged)."""
+    if not backup_on() or not os.path.isfile(path) or not _backup_ok(os.path.basename(path)):
+        return
+
+    def work():
+        with _backup_lock:
+            name = os.path.basename(path)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                blob = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+                rp = f"{BACKUP_PATH}/{name}"
+                r = _gh("GET", f"{rp}?ref={urllib.parse.quote(BACKUP_BRANCH)}")
+                sha = r.json().get("sha") if r.status_code == 200 else None
+                if sha == blob:
+                    return
+                body = {"message": f"faceless-bot backup: {name}", "branch": BACKUP_BRANCH,
+                        "content": base64.b64encode(data).decode()}
+                if sha:
+                    body["sha"] = sha
+                r = _gh("PUT", rp, json=body)
+                if r.status_code >= 300:
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
+            except Exception as e:
+                status(f"⚠️ Backup of {esc(name)} failed: {esc(str(e)[:200])}")
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def backup_delete(name):
+    if not backup_on() or not _backup_ok(name):
+        return
+
+    def work():
+        with _backup_lock:
+            try:
+                rp = f"{BACKUP_PATH}/{name}"
+                r = _gh("GET", f"{rp}?ref={urllib.parse.quote(BACKUP_BRANCH)}")
+                if r.status_code != 200:
+                    return
+                _gh("DELETE", rp, json={"message": f"faceless-bot backup: remove {name}",
+                                        "sha": r.json()["sha"], "branch": BACKUP_BRANCH})
+            except Exception as e:
+                print(f"backup delete failed: {e}", flush=True)
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def restore_from_github():
+    """On start: bring back any saved file that is missing locally (fresh deploy without a volume)."""
+    if not backup_on():
+        return
+    try:
+        r = _gh("GET", f"{BACKUP_PATH}?ref={urllib.parse.quote(BACKUP_BRANCH)}")
+        if r.status_code == 404:
+            status("ℹ️ Backup repo reachable, nothing saved there yet (it fills as you save things).")
+            return
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
+        n = 0
+        for it in r.json():
+            name = it.get("name", "")
+            if it.get("type") != "file" or not _backup_ok(name):
+                continue
+            if name.startswith("reference."):
+                if reference_path():
+                    continue
+            elif os.path.isfile(os.path.join(DATA_DIR, name)):
+                continue
+            raw = _gh("GET", f"{BACKUP_PATH}/{name}?ref={urllib.parse.quote(BACKUP_BRANCH)}",
+                      accept="application/vnd.github.raw+json")
+            if raw.status_code == 200:
+                with open(os.path.join(DATA_DIR, name), "wb") as f:
+                    f.write(raw.content)
+                n += 1
+        if n:
+            status(f"♻️ Restored {n} saved file(s) from the backup repo.")
+    except Exception as e:
+        status(f"⚠️ Couldn't restore from the backup repo: {esc(str(e)[:200])}")
+
+
+def storage_status():
+    """List of ways your data survives a redeploy (empty = it does NOT)."""
+    out = []
+    vol = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "")
+    if vol and os.path.abspath(DATA_DIR).startswith(os.path.abspath(vol)):
+        out.append(f"Railway volume ({vol})")
+    if backup_on():
+        out.append(f"GitHub backup ({BACKUP_REPO})")
+    return out
+
+
+def init_storage():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    restore_from_github()
+    apply_settings()
+    s = storage_status()
+    status("💾 Saved data survives redeploys via: " + ", ".join(s) if s else
+           "⚠️ Nothing keeps your saved data across redeploys yet - add a Railway volume or set BACKUP_REPO.")
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +975,7 @@ def describe_frame(frame_path, narration):
 
 
 # ---------------------------------------------------------------------------
-# Krea: your style -> images
+# Krea: your style -> images (API key route)
 # ---------------------------------------------------------------------------
 def krea_headers():
     return {"Authorization": f"Bearer {KREA_API_KEY}"}
@@ -815,7 +1047,7 @@ def krea_image(prompt, ref_url, dest):
 
 
 # ---------------------------------------------------------------------------
-# Voice-over: Fish Audio -> (Gemini, optional) -> free Microsoft voice
+# Voice-over: Fish Audio -> ElevenLabs -> (Gemini, optional) -> free Microsoft voice
 # ---------------------------------------------------------------------------
 def fish_tts(text, dest):
     body = {"text": text, "format": "mp3"}
@@ -979,7 +1211,7 @@ def check_setup():
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
         missing.insert(0, "GEMINI_API_KEY (free at aistudio.google.com)")
     if missing:
-        raise RuntimeError("missing env vars: " + ", ".join(missing))
+        raise RuntimeError("missing settings: " + ", ".join(missing))
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise RuntimeError(f"{tool} is not installed")
@@ -1015,6 +1247,7 @@ def oauth_load():
 def oauth_save(d):
     with open(KREA_OAUTH_FILE, "w", encoding="utf-8") as f:
         json.dump(d, f)
+    backup_file(KREA_OAUTH_FILE)
 
 
 def krea_connected():
@@ -1263,6 +1496,16 @@ def _pick_prop(tool, names):
     return None
 
 
+def _find_tool(tools, patterns, exclude=("list_", "read_", "write_", "delete_", "tag")):
+    """First MCP tool whose name contains one of the patterns (file/tag tools are skipped)."""
+    for pat in patterns:
+        for name in tools:
+            n = name.lower()
+            if pat in n and not n.startswith(exclude):
+                return name
+    return None
+
+
 _ref_uri = {}
 
 
@@ -1283,25 +1526,33 @@ def reference_data_uri():
 def krea_mcp_image(prompt, ref_uri, dest):
     mcp_ready()
     tools = _mcp["tools"]
-    gen = tools.get("generate")
-    if not gen:
-        raise RuntimeError("Krea MCP has no 'generate' tool (it offers: " + ", ".join(tools) + ")")
+    gname = _find_tool(tools, ["generate_image", "image_generate", "generate", "create_image", "text_to_image", "image"])
+    if not gname:
+        full = "; ".join(f"{n}: {json.dumps((t.get('inputSchema') or {}).get('properties') or {})[:300]}"
+                         for n, t in tools.items())
+        print(f"KREA MCP TOOLS (full): {full}", flush=True)
+        raise RuntimeError("Krea MCP has no image tool. Tools: " + ", ".join(tools))
+    gen = tools[gname]
+    props = (gen.get("inputSchema") or {}).get("properties") or {}
     model_key = _pick_prop(gen, ["model", "model_id", "modelId", "model_path"]) or "model"
     box = _pick_prop(gen, ["input", "inputs", "params", "parameters", "arguments", "body"])
     model = KREA_MODEL if KREA_MODEL.startswith(("image/", "video/")) else "image/" + KREA_MODEL
     base = {"prompt": prompt}
     if ref_uri:
         base["image_style_references"] = [{"url": ref_uri, "strength": STYLE_STRENGTH}]
+    jobtool = _find_tool(tools, ["get_job", "job_status", "check_job", "job"])
     err = ""
     for vi in range(_mcp_variant[0], len(SIZE_VARIANTS)):
         inputs = {**base, **SIZE_VARIANTS[vi]}
-        args = {model_key: model}
+        args = {}
+        if model_key in props:
+            args[model_key] = model
         if box:
             args[box] = inputs
         else:
             args.update(inputs)
         try:
-            data = mcp_tool("generate", args)
+            data = mcp_tool(gname, args)
         except RuntimeError as e:
             msg = str(e)
             if any(w in msg.lower() for w in ("compute", "credit", "insufficient", "billing", "balance", "quota", "402")):
@@ -1315,16 +1566,16 @@ def krea_mcp_image(prompt, ref_uri, dest):
             st = str(_find_key(data, ["status"]) or "").lower()
             if st in ("failed", "cancelled", "canceled", "error"):
                 raise RuntimeError(f"Krea job {st}: {str(data)[:200]}")
-            urls = _find_urls(_find_key(data, ["result", "output", "outputs"]) or {})
+            urls = _find_urls(_find_key(data, ["result", "output", "outputs"]) or data)
             if urls:
                 break
-            if not jid:
-                raise RuntimeError(f"couldn't read the job id from Krea's reply: {str(data)[:200]}")
+            if not jid or not jobtool:
+                raise RuntimeError(f"no image URL in Krea's reply: {str(data)[:200]}")
             if time.time() - t0 > 300:
                 raise RuntimeError("Krea job timed out")
             time.sleep(3)
-            jk = _pick_prop(tools.get("get_job"), ["jobId", "job_id", "id"]) or "jobId"
-            data = mcp_tool("get_job", {jk: jid})
+            jk = _pick_prop(tools.get(jobtool), ["jobId", "job_id", "id"]) or "jobId"
+            data = mcp_tool(jobtool, {jk: jid})
         img = http("GET", urls[0], timeout=120)
         if img.status_code != 200:
             raise RuntimeError(f"couldn't download Krea image ({img.status_code})")
@@ -1342,27 +1593,36 @@ def krea_test():
         mcp_ready()
         tools = _mcp["tools"]
         status("🧪 Connected. Krea tools: " + esc(", ".join(tools) or "none"))
-        g = tools.get("generate")
-        if g:
-            status("🧪 generate inputs: " + esc(json.dumps((g.get("inputSchema") or {}).get("properties") or {})[:600]))
+        for n, t in tools.items():
+            print(f"KREA TOOL {n}: {json.dumps((t.get('inputSchema') or {}).get('properties') or {})[:500]}", flush=True)
+        gname = _find_tool(tools, ["generate_image", "image_generate", "generate", "create_image", "text_to_image", "image"])
+        if gname:
+            g = tools[gname]
+            status(f"🧪 Using tool <b>{esc(gname)}</b>, inputs: "
+                   + esc(json.dumps((g.get("inputSchema") or {}).get("properties") or {})[:600]))
+        else:
+            status("🧪 No image-generation tool found in that list (full schemas are in the Railway logs).")
         dest = os.path.join(OUT_DIR, "krea_test.png")
         krea_mcp_image("a friendly cartoon caveman sitting by a campfire at night", reference_data_uri(), dest)
         status('✅ Krea works with your credits: <a href="/out/krea_test.png" target="_blank">see the test image</a>')
     except Exception as e:
-        status(f"❌ Krea test failed: {esc(str(e)[:500])}")
+        status(f"❌ Krea test failed: {esc(str(e)[:600])}")
 
 
 def krea_card():
     if krea_connected():
+        extra = ""
+        if not storage_status():
+            extra = ('<details style="margin-top:12px"><summary>Keep it after redeploys (no storage set up)</summary><div class="sb">'
+                     'Best fix: add a Railway volume or set BACKUP_REPO. Otherwise paste this into the '
+                     '<code>KREA_OAUTH_BLOB</code> env var. It is a secret login, keep it private.'
+                     f'<textarea readonly rows="4" style="width:100%;margin-top:8px;background:#08080d;color:#eaeaf2;border:1px solid #26263a;border-radius:8px">{esc(krea_blob())}</textarea>'
+                     '</div></details>')
         return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
                 '&#9989; Connected. Images use your normal Krea compute credits first.</div>'
                 '<form method="POST" action="/krea/test" style="display:inline"><button type="submit">Test it</button></form> '
                 '<form method="POST" action="/krea/disconnect" style="display:inline"><button type="submit" style="background:#26263a">Disconnect</button></form>'
-                '<details style="margin-top:12px"><summary>Keep it after redeploys</summary><div class="sb">'
-                'Paste this between the quotes of <code>KREA_OAUTH_BLOB = ""</code> near the top of the code '
-                '(or add a Railway volume at the data folder). It is a secret login, keep it private.'
-                f'<textarea readonly rows="4" style="width:100%;margin-top:8px;background:#08080d;color:#eaeaf2;border:1px solid #26263a;border-radius:8px">{esc(krea_blob())}</textarea>'
-                '</div></details></div>')
+                + extra + '</div>')
     return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
             'Not connected. Sign in once so the bot can spend your normal Krea credits. On the Krea screen, '
             'pick the workspace that has the credits.</div>'
@@ -1394,7 +1654,7 @@ def make_images(unique, prompts, imgdir):
     if CF_IMAGE_URL:
         options.append(("Cloudflare AI (free)", lambda pr, d: cf_image(pr + ". " + (STYLE_HINT or CF_STYLE), d), 2))
     if not options:
-        raise RuntimeError("no image provider: set KREA_API_KEY or paste CF_IMAGE_URL in the code")
+        raise RuntimeError("no image provider: connect Krea, set a Krea API key or a Cloudflare worker URL in Settings")
 
     def dest(i):
         return os.path.join(imgdir, f"img{i:03d}.png")
@@ -1406,7 +1666,8 @@ def make_images(unique, prompts, imgdir):
         except Exception as e:
             if last:
                 raise
-            why = "no API balance" if "402" in str(e) else str(e)[:100]
+            why = "no API balance" if "402" in str(e) else str(e)[:400]
+            print(f"{name} failed: {e}", flush=True)
             status(f"⚠️ {name} unavailable ({esc(why)}). Trying the next image provider ...")
             continue
         status(f"🎨 Images: {name}")
@@ -1416,7 +1677,7 @@ def make_images(unique, prompts, imgdir):
         except Exception as e:
             if last:
                 raise
-            status(f"⚠️ {name} failed mid-way ({esc(str(e)[:80])}). Redoing all images with the next provider ...")
+            status(f"⚠️ {name} failed mid-way ({esc(str(e)[:200])}). Redoing all images with the next provider ...")
             continue
         return name
 
@@ -1672,12 +1933,13 @@ PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Face
 .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px}
 .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}
 label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 6px}
-input[type=text],input[type=number]{background:var(--p2);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font:inherit;width:100%}
+input[type=text],input[type=number],input[type=password]{background:var(--p2);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font:inherit;width:100%}
 button{background:linear-gradient(135deg,var(--a),var(--a2));color:#fff;border:0;padding:11px 16px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:14px}
 .feed{display:flex;flex-direction:column;gap:7px;max-height:360px;overflow-y:auto}
 .fi{background:#08080d;border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:13px;line-height:1.5}
 a{color:var(--a2);text-decoration:none}.hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
-.warn{border-color:rgba(255,59,92,.4);color:#ffb3c0;font-size:13px}video{width:100%;border-radius:12px;background:#000}
+.warn{border-color:rgba(255,59,92,.4);color:#ffb3c0;font-size:13px}.ok{border-color:rgba(60,200,120,.35);color:#b6f0cf;font-size:13px}
+video{width:100%;border-radius:12px;background:#000}
 img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);display:block;margin-bottom:8px}
 details{background:var(--p2);border:1px solid var(--border);border-radius:12px;margin-bottom:8px}
 summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
@@ -1690,15 +1952,17 @@ summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
 </style></head><body><div class="wrap">
 <h1>Faceless Bot - preview</h1><div class="sub">Channel in, rebuilt video out. Nothing is posted.</div>
 @@WARN@@
+@@STORE@@
 <div class="card"><h2>1. Your animation style</h2>@@REF@@
 <input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"> <span id="upmsg" class="hint"></span>
 <div class="hint">Krea copies the look of this image. (The free Cloudflare fallback can't use it.)</div></div>
 <div class="card"><h2>YouTube cookies (only for the downloader fallback)</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
 <input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
 @@KREA@@
+@@SETTINGS@@
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
-<input type="text" name="handle" placeholder="@channelname" required>
+<input type="text" name="handle" placeholder="@channelname" value="@@HANDLE@@" required>
 <label>Seconds of the video to rebuild</label><input type="number" name="seconds" min="20" max="600" value="@@SECS@@">
 <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="fresh" value="1"> Start fresh (ignore saved progress)</label>
 <button type="submit" id="runbtn">@@BTN@@</button></form>
@@ -1797,20 +2061,19 @@ def stages_html():
         b5 = (f'<video controls preload="metadata" src="/out/preview.mp4?t={_mt(pv)}"></video>'
               f'<div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div>')
 
+    bodies = [b0, b1, b2, b3, b4, b5]
     if job_error[0] and pend is not None:
-        err = f'<div class="m" style="color:#ffb3c0">Stopped here: {esc(job_error[0][:200])}</div>'
-        bodies = [b0, b1, b2, b3, b4, b5]
-        bodies[pend] += err
-        b0, b1, b2, b3, b4, b5 = bodies
+        bodies[pend] += f'<div class="m" style="color:#ffb3c0">Stopped here: {esc(job_error[0][:200])}</div>'
 
     n = len(scenes)
+    vname = esc(vo.get("name")) if vo else ""
+    iname = esc(im.get("provider")) if im else ""
     titles = ["1. Latest video found",
-              f"2. Gemini watched the video{f' ({n} scenes)' if n else ''}",
+              "2. Gemini watched the video" + (f" ({n} scenes)" if n else ""),
               "3. Narration rewritten",
-              f"4. Voice-over{f' ({esc(vo.get(chr(110) + chr(97) + chr(109) + chr(101)))})' if vo else ''}",
-              f"5. Images redrawn{f' ({esc(im.get(chr(112) + chr(114) + chr(111) + chr(118) + chr(105) + chr(100) + chr(101) + chr(114)))})' if im else ''}",
+              "4. Voice-over" + (f" ({vname})" if vo else ""),
+              "5. Images redrawn" + (f" ({iname})" if im else ""),
               "6. Final video"]
-    bodies = [b0, b1, b2, b3, b4, b5]
     return "".join(f'<details data-id="s{i}"><summary>{icon(i)} {titles[i]}</summary><div class="sb">{bodies[i]}</div></details>'
                    for i in range(6))
 
@@ -1824,18 +2087,50 @@ def live_html():
     return out + f'<div class="card"><h2>Activity</h2><div class="feed">{feed}</div></div>'
 
 
+def store_card():
+    s = storage_status()
+    if s:
+        return ('<div class="card ok">&#128190; Your settings, style image, cookies and Krea login survive redeploys: '
+                + esc(", ".join(s)) + ".</div>")
+    return ('<div class="card warn">&#9888; Saved data is lost on every redeploy. Fix (pick one): '
+            '<b>1)</b> Railway: service &rarr; Settings &rarr; Volumes &rarr; add a volume mounted at <code>/data</code>. '
+            '<b>2)</b> Set <code>BACKUP_REPO</code> (a PRIVATE GitHub repo, <code>user/repo</code>) and <code>GITHUB_TOKEN</code> '
+            'in Railway variables.</div>')
+
+
+def settings_card():
+    rows = ""
+    for key, label, kind in SETTING_FIELDS:
+        cur = globals()[key]
+        if kind == "bool":
+            rows += (f'<label style="display:flex;gap:8px;align-items:center;color:var(--text)">'
+                     f'<input type="checkbox" name="{key}" value="1"{" checked" if cur else ""}> {esc(label)}</label>')
+        elif kind == "secret":
+            ph = ("saved ····" + str(cur)[-4:]) if cur else "not set"
+            rows += (f'<label>{esc(label)} <span class="m">(blank = keep, "-" = clear)</span></label>'
+                     f'<input type="password" name="{key}" placeholder="{esc(ph)}" autocomplete="off">')
+        else:
+            rows += f'<label>{esc(label)}</label><input type="text" name="{key}" value="{esc(cur)}">'
+    return ('<div class="card"><h2>Settings (saved)</h2><details><summary>Keys, voices and style</summary><div class="sb">'
+            '<form method="POST" action="/settings">' + rows +
+            '<button type="submit">Save settings</button></form>'
+            '<div class="hint">Saved values win over Railway variables. They take effect immediately.</div></div></details></div>')
+
+
 def render_page():
     warns = []
     if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
-        warns.append("GEMINI_API_KEY is not set (free key at aistudio.google.com)")
+        warns.append("No Gemini key yet: add it under Settings below (free key at aistudio.google.com)")
     if not (KREA_API_KEY or CF_IMAGE_URL or krea_connected()):
-        warns.append("No image provider: connect Krea below, set KREA_API_KEY or paste CF_IMAGE_URL in the code")
+        warns.append("No image provider: connect Krea below, or add a Krea API key / Cloudflare worker URL in Settings")
     warn = "".join(f'<div class="card warn">&#9888; {esc(w)}</div>' for w in warns)
     ref = f'<img class="ref" src="/ref?t={int(time.time())}">' if reference_path() else \
         '<div class="hint" style="margin:0 0 8px">No reference image yet.</div>'
     ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
           "No cookies. Not needed while Gemini can watch the video.")
-    rep_ = {"@@KREA@@": krea_card(), "@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
+    rep_ = {"@@STORE@@": store_card(), "@@SETTINGS@@": settings_card(), "@@KREA@@": krea_card(),
+            "@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
+            "@@HANDLE@@": esc(settings_load().get("LAST_HANDLE", "")),
             "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
             "@@RELOAD@@": "poll();" if job_running else ""}
     page = PAGE
@@ -1878,6 +2173,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _form(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length).decode() if length else ""
+        return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
     def _serve_file(self, path):
         if not os.path.isfile(path):
@@ -1976,6 +2276,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, b"this doesn't look like a YouTube cookies.txt")
             with open(COOKIES_SAVED, "wb") as f:
                 f.write(data)
+            backup_file(COOKIES_SAVED)
             status("🍪 YouTube cookies saved.")
             return self._send(200, b"ok")
         if u.path != "/upload-ref":
@@ -1993,8 +2294,12 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(os.path.join(DATA_DIR, "reference" + e))
             except OSError:
                 pass
-        with open(os.path.join(DATA_DIR, "reference" + ext), "wb") as f:
+            if e != ext:
+                backup_delete("reference" + e)
+        newp = os.path.join(DATA_DIR, "reference" + ext)
+        with open(newp, "wb") as f:
             f.write(data)
+        backup_file(newp)
         status("🖼️ Style reference image updated.")
         self._send(200, b"ok")
 
@@ -2010,14 +2315,21 @@ class Handler(BaseHTTPRequestHandler):
                 os.remove(KREA_OAUTH_FILE)
             except OSError:
                 pass
+            backup_delete("krea_oauth.json")
             with _mcp["lock"]:
                 _mcp["tools"] = None
             status("🔌 Krea disconnected.")
             return self._redir("/")
+        if ppath == "/settings":
+            try:
+                settings_from_form(self._form())
+                status("💾 Settings saved.")
+            except Exception as e:
+                status(f"❌ Couldn't save settings: {esc(str(e)[:200])}")
+            return self._redir("/")
         if ppath != "/run":
             return self._send(404, b"not found")
-        length = int(self.headers.get("Content-Length", 0))
-        f = urllib.parse.parse_qs(self.rfile.read(length).decode() if length else "")
+        f = self._form()
         handle = (f.get("handle") or [""])[0].strip()
         try:
             seconds = int((f.get("seconds") or [str(PREVIEW_SECONDS)])[0])
@@ -2025,6 +2337,10 @@ class Handler(BaseHTTPRequestHandler):
             seconds = PREVIEW_SECONDS
         fresh = bool((f.get("fresh") or [""])[0])
         if handle:
+            try:
+                settings_update({"LAST_HANDLE": handle, "PREVIEW_SECONDS": str(seconds)})
+            except Exception as e:
+                print(f"couldn't save run settings: {e}", flush=True)
             status(f"▶️ Preview started for {esc(handle)}" + (" (fresh start)." if fresh else "."))
             threading.Thread(target=run_job, args=(handle, seconds, fresh), daemon=True).start()
         self.send_response(303)
@@ -2036,12 +2352,14 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if len(sys.argv) > 1:                       # CLI mode
         load_cookies_env()
+        init_storage()
         startup_update()
         out = build_preview(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
         print("Done:", out)
         return
     port = int(os.environ.get("PORT", 8080))
     load_cookies_env()
+    init_storage()
     threading.Thread(target=startup_update, daemon=True).start()
     threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever, daemon=True).start()
     print(f"Faceless bot dashboard on port {port}", flush=True)
