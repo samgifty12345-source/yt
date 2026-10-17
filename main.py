@@ -34,7 +34,13 @@ Env vars:
   STYLE_STRENGTH      optional 0-1, how strongly the reference style applies (0.8)
   PREVIEW_SECONDS     optional, how much of the source video to rebuild (90)
   OUT_W / OUT_H       optional output size, default 1280x720
-  YOUTUBE_COOKIES_FILE optional cookies.txt (needed if YouTube blocks the server)
+  YOUTUBE_COOKIES_URL GitHub link to your cookies.txt (default: the one you gave me). The bot
+                      downloads it at start and before every preview, so replacing the file
+                      on GitHub refreshes it. If the repo is PRIVATE also set GITHUB_TOKEN
+                      (token with read access to Contents).
+  YOUTUBE_COOKIES_B64 base64 of a YouTube cookies.txt (needed on Railway: YouTube blocks
+                      server IPs). Or upload cookies.txt on the dashboard instead.
+  YOUTUBE_COOKIES_FILE optional path to a cookies.txt already on disk
   DASHBOARD_PASSWORD  optional
   PORT                optional, default 8080
 
@@ -83,6 +89,9 @@ OUT_H = int(os.environ.get("OUT_H", "720"))
 FPS = 30
 SUB_LANGS = os.environ.get("SUB_LANGS", "en,en.*").split(",")
 YOUTUBE_COOKIES_FILE = os.environ.get("YOUTUBE_COOKIES_FILE", "")
+YOUTUBE_COOKIES_URL = os.environ.get("YOUTUBE_COOKIES_URL",
+                                     "https://github.com/samgifty12345-source/bedu/blob/main/cookies%20(1).txt").strip()
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 FFMPEG_THREADS = os.environ.get("FFMPEG_THREADS", "2")
 
@@ -163,10 +172,64 @@ def reference_path():
 # ---------------------------------------------------------------------------
 # YouTube: latest video, subtitles, clip
 # ---------------------------------------------------------------------------
+COOKIES_SAVED = os.path.join(DATA_DIR, "youtube_cookies.txt")
+
+
+def load_cookies_env():
+    b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+    if b64:
+        try:
+            with open(COOKIES_SAVED, "wb") as f:
+                f.write(base64.b64decode(b64))
+        except Exception as e:
+            print(f"Could not decode YOUTUBE_COOKIES_B64: {e}", flush=True)
+
+
+def fetch_cookies_from_github():
+    """Download the cookies.txt from GitHub (blob link works). Keeps the old copy if it fails."""
+    if not YOUTUBE_COOKIES_URL:
+        return
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(?:blob|raw)/([^/]+)/(.+)$", YOUTUBE_COOKIES_URL)
+    if not m:
+        status("⚠️ YOUTUBE_COOKIES_URL must be a github.com .../blob/<branch>/<file> link.")
+        return
+    owner, repo, branch, path = m.groups()
+    path = urllib.parse.quote(urllib.parse.unquote(path))
+    try:
+        if GITHUB_TOKEN:
+            r = http("GET", f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}",
+                     headers={"Authorization": f"Bearer {GITHUB_TOKEN}",
+                              "Accept": "application/vnd.github.raw+json"}, timeout=30)
+        else:
+            r = http("GET", f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}", timeout=30)
+        if r.status_code != 200:
+            hint = " (private repo? set GITHUB_TOKEN)" if r.status_code in (401, 403, 404) and not GITHUB_TOKEN else ""
+            raise RuntimeError(f"HTTP {r.status_code}{hint}")
+        if b"youtube.com" not in r.content:
+            raise RuntimeError("that file doesn't look like a YouTube cookies.txt")
+        with open(COOKIES_SAVED, "wb") as f:
+            f.write(r.content)
+        print("YouTube cookies loaded from GitHub", flush=True)
+    except Exception as e:
+        status(f"⚠️ Couldn't load cookies from GitHub: {esc(str(e)[:200])}"
+               + (" - using the last saved copy." if cookies_path() else ""))
+
+
+def cookies_path():
+    for p in (YOUTUBE_COOKIES_FILE, COOKIES_SAVED):
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
 def ydl_opts(**extra):
     o = {"quiet": True, "no_warnings": True}
-    if YOUTUBE_COOKIES_FILE and os.path.exists(YOUTUBE_COOKIES_FILE):
-        o["cookiefile"] = YOUTUBE_COOKIES_FILE
+    cp = cookies_path()
+    if cp:
+        # yt-dlp rewrites the cookie file, so give it a private copy
+        tmp_cp = os.path.join(tempfile.gettempdir(), "yt_cookies_copy.txt")
+        shutil.copyfile(cp, tmp_cp)
+        o["cookiefile"] = tmp_cp
     o.update(extra)
     return o
 
@@ -448,7 +511,8 @@ def krea_wait(job_id, timeout=300):
 # Different Krea models name the size option differently; try them in order
 # and remember the first one that is accepted.
 _size_variant = [0]
-SIZE_VARIANTS = [{"aspect_ratio": "16:9"}, {"width": 1344, "height": 768}, {}]
+SIZE_VARIANTS = [{"aspect_ratio": "16:9", "resolution": "1K"}, {"aspect_ratio": "16:9"},
+                 {"width": 1344, "height": 768}, {}]
 
 
 def krea_image(prompt, ref_url, dest):
@@ -540,6 +604,7 @@ def check_setup():
 
 def build_preview(handle, seconds=None):
     check_setup()
+    fetch_cookies_from_github()
     seconds = max(20, int(seconds or PREVIEW_SECONDS))
     work = tempfile.mkdtemp(prefix="fl_")
     try:
@@ -641,7 +706,11 @@ def run_job(handle, seconds):
         build_preview(handle, seconds)
     except Exception as e:
         print(f"Job failed: {type(e).__name__}: {e}", flush=True)
-        status(f"❌ {esc(str(e)[:400])}")
+        if "Sign in to confirm" in str(e):
+            have = "Your cookies were rejected or expired - export fresh ones" if cookies_path() else "Upload a YouTube cookies.txt on the dashboard (or set YOUTUBE_COOKIES_B64)"
+            status(f"❌ YouTube thinks the server is a bot. {have}.")
+        else:
+            status(f"❌ {esc(str(e)[:400])}")
     finally:
         job_running = False
         job_lock.release()
@@ -671,6 +740,8 @@ img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);displ
 <div class="card"><h2>1. Your animation style</h2>@@REF@@
 <input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"> <span id="upmsg" class="hint"></span>
 <div class="hint">Every redrawn frame copies the look of this image.</div></div>
+<div class="card"><h2>YouTube cookies</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
+<input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
 <div class="card"><h2>2. Build a preview</h2>
 <form method="POST" action="/run"><label>YouTube channel handle or link</label>
 <input type="text" name="handle" placeholder="@channelname" required>
@@ -683,6 +754,8 @@ img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);displ
 async function up(i){const f=i.files[0];if(!f)return;document.getElementById('upmsg').textContent='Uploading...';
 const r=await fetch('/upload-ref?name='+encodeURIComponent(f.name),{method:'PUT',body:f});
 if(!r.ok){document.getElementById('upmsg').textContent='Failed: '+await r.text();return}location.reload()}
+async function upc(i){const f=i.files[0];if(!f)return;const r=await fetch('/upload-cookies',{method:'PUT',body:f});
+if(!r.ok){document.getElementById('upc').textContent='Failed: '+await r.text();return}location.reload()}
 @@RELOAD@@
 </script></body></html>"""
 
@@ -705,7 +778,9 @@ def render_page():
     if os.path.isfile(pv):
         video = (f'<div class="card"><h2>Latest preview</h2><video controls src="/out/preview.mp4?t={int(os.path.getmtime(pv))}">'
                  f'</video><div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div></div>')
-    rep = {"@@WARN@@": warn, "@@REF@@": ref, "@@FEED@@": feed, "@@VIDEO@@": video,
+    ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
+          "No cookies yet. YouTube blocks server IPs, so upload a cookies.txt exported from a logged-in browser.")
+    rep = {"@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@FEED@@": feed, "@@VIDEO@@": video,
            "@@SECS@@": str(PREVIEW_SECONDS), "@@BTN@@": "Building..." if job_running else "Build preview",
            "@@RELOAD@@": "setTimeout(()=>location.reload(),4000);" if job_running else ""}
     html = PAGE
@@ -798,6 +873,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return self._deny()
         u = urllib.parse.urlparse(self.path)
+        if u.path == "/upload-cookies":
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0 or length > 2 * 1024 * 1024:
+                return self._send(413, b"cookies file too large")
+            data = self.rfile.read(length)
+            if b"youtube.com" not in data:
+                return self._send(400, b"this doesn't look like a YouTube cookies.txt")
+            with open(COOKIES_SAVED, "wb") as f:
+                f.write(data)
+            status("🍪 YouTube cookies saved.")
+            return self._send(200, b"ok")
         if u.path != "/upload-ref":
             return self._send(404, b"not found")
         name = (urllib.parse.parse_qs(u.query).get("name") or [""])[0].lower()
@@ -841,10 +927,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     if len(sys.argv) > 1:                       # CLI mode
+        load_cookies_env()
         out = build_preview(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
         print("Done:", out)
         return
     port = int(os.environ.get("PORT", 8080))
+    load_cookies_env()
     threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever, daemon=True).start()
     print(f"Faceless bot dashboard on port {port}", flush=True)
     while True:
