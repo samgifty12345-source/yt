@@ -52,6 +52,7 @@ Or one-shot from CLI: python faceless_bot.py @channelhandle 90
 import os
 import re
 import sys
+import html
 import json
 import math
 import time
@@ -270,11 +271,11 @@ def cookies_path():
     return ""
 
 
-def ydl_opts(**extra):
-    o = {"quiet": True, "no_warnings": True,
-         "extractor_args": {"youtubetab": {"skip": ["authcheck"]}}}   # same as --extractor-args youtubetab:skip=authcheck
-    cp = cookies_path()
+def ydl_opts(cookies=True, **extra):
+    o = {"quiet": True, "no_warnings": True}
+    cp = cookies_path() if cookies else ""
     if cp:
+        o["extractor_args"] = {"youtubetab": {"skip": ["authcheck"]}}   # = --extractor-args youtubetab:skip=authcheck
         # yt-dlp rewrites the cookie file, so give it a private copy
         tmp_cp = os.path.join(tempfile.gettempdir(), "yt_cookies_copy.txt")
         shutil.copyfile(cp, tmp_cp)
@@ -309,15 +310,42 @@ def first_video(info):
     return None
 
 
+def latest_via_rss(handle):
+    """Fallback: the channel's public RSS feed (no login needed)."""
+    page = http("GET", channel_url(handle).rsplit("/videos", 1)[0], timeout=30,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"})
+    m = re.search(r'"(?:channelId|externalId)":"(UC[\w-]{22})"', page.text) or \
+        re.search(r'channel_id=(UC[\w-]{22})', page.text)
+    if not m:
+        return None
+    feed = http("GET", f"https://www.youtube.com/feeds/videos.xml?channel_id={m.group(1)}", timeout=30)
+    e = re.search(r"<entry>.*?<yt:videoId>([^<]+)</yt:videoId>.*?<title>([^<]*)</title>", feed.text, re.S)
+    if not e:
+        return None
+    return {"id": e.group(1), "title": html.unescape(e.group(2)),
+            "url": f"https://www.youtube.com/watch?v={e.group(1)}"}
+
+
 def latest_video(handle):
     import yt_dlp
-    with yt_dlp.YoutubeDL(ydl_opts(extract_flat=True, playlistend=3)) as y:
-        info = y.extract_info(channel_url(handle), download=False)
-    v = first_video(info or {})
-    if not v:
-        raise RuntimeError("couldn't find any videos on that channel")
-    return {"id": v["id"], "title": v.get("title") or v["id"],
-            "url": f"https://www.youtube.com/watch?v={v['id']}"}
+    last = None
+    for use_cookies in (False, True):     # the channel page often works better without cookies
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts(cookies=use_cookies, extract_flat=True, playlistend=3)) as y:
+                info = y.extract_info(channel_url(handle), download=False)
+            v = first_video(info or {})
+            if v:
+                return {"id": v["id"], "title": v.get("title") or v["id"],
+                        "url": f"https://www.youtube.com/watch?v={v['id']}"}
+        except Exception as e:
+            last = e
+    try:
+        v = latest_via_rss(handle)
+        if v:
+            return v
+    except Exception as e:
+        last = last or e
+    raise last or RuntimeError("couldn't find any videos on that channel")
 
 
 def parse_json3(path):
