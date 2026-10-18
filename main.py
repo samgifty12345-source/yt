@@ -1,53 +1,36 @@
-"""Faceless YouTube bot - v2 (preview + banks + frame references + cheap-model ladder + kill switch + auto-post).
+"""Faceless YouTube bot - v3 (Groq text, key pools, split-in-two, review gate, new dashboard).
 
 What it does, step by step:
-  1. You give it a YouTube channel handle (@somechannel) OR a direct video link.
-  2. It finds the video (channel -> latest long-form video).
-  3. Gemini WATCHES the video (opens the public YouTube link itself) and returns the scenes.
-     Fallback: yt-dlp subtitles + scene detection.
-  4. The AI rewrites the narration of every scene (same meaning, new wording).
-  5. Voice-over per scene (Fish Audio -> ElevenLabs -> Microsoft free voice).
-  6. The source video is downloaded ONCE (Vid Kraken, 360p; fallback yt-dlp) into the VIDEO BANK, a real frame is
-     cut for every scene, and Krea redraws it using TWO images: your style reference + that frame.
-     Krea models are tried cheapest first; a model that can't take reference images is skipped and the next one
-     is tried, up to the medium model. Free Cloudflare worker is the last resort.
-  7. Slow zoom / pan per scene, stitched into one video.
-  8. A thumbnail is redrawn from the source video's thumbnail, and a new title / description / tags are written.
-  9. Optional: the video is posted to YouTube through Zernio (not made for kids). Auto-post is a toggle; you can
-     always press "Post to YouTube now" yourself instead.
+  1. You give it a channel handle (latest video) OR a direct link to ONE video.
+  2. Gemini WATCHES the video (opens the public YouTube link itself) and returns the scenes. This is the only
+     step that needs Gemini. Fallback: yt-dlp subtitles + scene detection.
+  3. GROQ rewrites the narration (same meaning, new wording) and writes the title / description / tags, so your
+     Gemini credits are only spent on watching. If Groq fails, Gemini/Anthropic can take over (a setting).
+  4. Voice-over (Fish Audio -> ElevenLabs -> Microsoft free voice). If a backup voice had to be used, the video is
+     flagged "needs review": it will NOT auto-post until you watch it and press Approve.
+  5. The source video is downloaded once (Vid Kraken -> yt-dlp) into the VIDEO BANK, a real frame is cut per scene and
+     Krea redraws it with TWO images (your style + that frame). Cheapest Krea model first, up to the medium one.
+  6. Optional: split the video in two halves -> two separate videos (Part 1 / Part 2).
+  7. Thumbnail redrawn from the source thumbnail, then optional posting to YouTube through Zernio (not made for kids).
 
-KILL SWITCH: the big red button stops everything (builds, ffmpeg, posting) and keeps the bot PAUSED, even after a
-redeploy, until you press Resume. Everything it already made stays saved so you can check it, or clear it.
+KEYS: every provider can have several keys. Keys saved on the website (Keys tab) AND Railway env vars
+(GROQ_API_KEY, GROQ_API_KEY_2, GROQ_API_KEY_3 ...) are all pooled; when one fails (invalid, out of credit, rate
+limited) the next is tried automatically. Paste a replacement on the Keys tab - no redeploy needed.
 
-BANKS (inside the data folder, so they survive a redeploy ONLY with a Railway Volume):
-  data/bank/videos/   downloaded source videos (so Vid Kraken's 10-per-day limit is only used once per video)
-  data/jobs/<video>/  scenes, rewrite, voice, frames, images, thumbnail, final video, post record
+KILL SWITCH: stops everything and keeps the bot PAUSED (even after a redeploy) until you press Resume.
 
-PERSISTENCE (so nothing you enter is lost on a Railway redeploy)
-  A) Railway Volume (service -> Settings -> Volumes -> mount path /data). Keeps EVERYTHING incl. the banks.
-  B) No volume: BACKUP_REPO=youruser/yourprivaterepo + GITHUB_TOKEN. Keeps only the small files (settings, style
-     image, cookies, Krea login). The banks are too big for that, so they need the volume.
-  BACKUP_BRANCH / BACKUP_TOKEN / DATA_DIR optional.
+BANKS (data folder - survive a redeploy only with a Railway Volume mounted at /data):
+  data/bank/videos/   source videos        data/jobs/<video>/  scenes, voice, frames, images, thumbnail, final video
 
-Env vars (ALL of these can also be typed into the dashboard Settings card, which wins over env):
-  GEMINI_API_KEY, ANTHROPIC_API_KEY, GEMINI_MODEL, WATCH_WITH_GEMINI
-  KREA_API_KEY, KREA_MODEL (default krea/krea-2/medium = the last model tried)
-  KREA_LADDER         comma list, cheapest first (default krea/krea-1,bfl/flux-1-dev,krea/krea-2/medium)
-  USE_CHEAP_KREA      1/0 try the ladder (default 1)
-  FRAME_REFS          1/0 send the real frame to Krea as a reference (default 1)
-  VIDKRAKEN_API_KEY   downloads the source video for the frames (free plan: ~10 downloads/day)
-  ZERNIO_API_KEY, ZERNIO_ACCOUNT_ID (optional, first YouTube account if empty)
-  AUTO_POST           1/0 post automatically when a build finishes (default 0)
-  POST_VISIBILITY     private (default) / unlisted / public
-  MARK_SYNTHETIC      1/0 tell YouTube the video has AI/synthetic content (default 0)
-  FISH_API_KEY, FISH_VOICE_ID, FISH_MODEL, ELEVENLABS_API_KEY, ELEVEN_VOICE_ID, ELEVEN_MODEL, EDGE_VOICE
-  CF_IMAGE_URL, CF_IMAGE_KEY, STYLE_HINT, STYLE_STRENGTH, PREVIEW_SECONDS, WHOLE_MAX_SECONDS, OUT_W, OUT_H
-  YOUTUBE_COOKIES_URL / _B64 / _FILE, PROXY_URL, DASHBOARD_PASSWORD (strongly recommended), PORT
+Env vars (everything also editable on the dashboard, which wins over env):
+  GROQ_API_KEY(+_2,_3..)  GROQ_MODELS  GROQ_VISION_MODEL  USE_GROQ  TEXT_FALLBACK
+  GEMINI_API_KEY(+_2..)  ANTHROPIC_API_KEY  KREA_API_KEY  KREA_MODEL  KREA_LADDER  USE_CHEAP_KREA  FRAME_REFS
+  VIDKRAKEN_API_KEY(+_2..)  ZERNIO_API_KEY  ZERNIO_ACCOUNT_ID  AUTO_POST  POST_VISIBILITY  MARK_SYNTHETIC
+  SPLIT_IN_TWO  REVIEW_ON_FALLBACK  FISH_API_KEY  ELEVENLABS_API_KEY  CF_IMAGE_URL  CF_IMAGE_KEY  DASHBOARD_PASSWORD
+  BACKUP_REPO / GITHUB_TOKEN / DATA_DIR / PROXY_URL / YOUTUBE_COOKIES_*  PORT
 
 Needs: pip install requests yt-dlp edge-tts   and ffmpeg + ffprobe installed.
-
-Run the dashboard:   python faceless_bot.py
-Or one-shot from CLI: python faceless_bot.py @channelhandle 90      (or a video link instead of the handle)
+Run:  python faceless_bot.py      (CLI: python faceless_bot.py @channel 90   or a video link)
 """
 import os
 import re
@@ -77,12 +60,19 @@ def _envbool(name, default="0"):
 
 
 # ---------------------------------------------------------------------------
-# Settings (defaults come from env vars; the dashboard Settings card overrides them)
+# Settings (defaults come from env vars; the dashboard Settings tab overrides them)
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODELS = os.environ.get("GROQ_MODELS", "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+USE_GROQ = _envbool("USE_GROQ", "1")
+TEXT_FALLBACK = _envbool("TEXT_FALLBACK", "1")
+SPLIT_IN_TWO = _envbool("SPLIT_IN_TWO", "0")
+REVIEW_ON_FALLBACK = _envbool("REVIEW_ON_FALLBACK", "1")
 KREA_API_KEY = os.environ.get("KREA_API_KEY", "")
 KREA_BASE = "https://api.krea.ai"
 KREA_MODEL = os.environ.get("KREA_MODEL", "krea/krea-2/medium")
@@ -149,31 +139,38 @@ REF_EXT = (".png", ".jpg", ".jpeg", ".webp")
 
 # Fields editable on the dashboard (saved in data/settings.json). (name, label, kind)
 SETTING_FIELDS = [
-    ("GEMINI_API_KEY", "Gemini API key", "secret"),
-    ("ANTHROPIC_API_KEY", "Anthropic API key (optional)", "secret"),
-    ("KREA_API_KEY", "Krea API key (optional)", "secret"),
+    ("USE_GROQ", "Use Groq for rewriting, titles and frame descriptions (saves Gemini credits)", "bool"),
+    ("GROQ_MODELS", "Groq text models, in order (comma separated)", "text"),
+    ("GROQ_VISION_MODEL", "Groq vision model (describes frames / thumbnails)", "text"),
+    ("TEXT_FALLBACK", "If Groq fails, fall back to Gemini / Anthropic for text", "bool"),
     ("USE_CHEAP_KREA", "Try the cheapest Krea models first (falls back up to the medium one)", "bool"),
     ("KREA_LADDER", "Krea models, cheapest first (comma separated, the medium one is always last)", "text"),
     ("KREA_MODEL", "Krea medium model (last resort)", "text"),
     ("FRAME_REFS", "Send the real video frame to Krea as a 2nd reference image", "bool"),
-    ("VIDKRAKEN_API_KEY", "Vid Kraken API key (downloads the video once for the frames)", "secret"),
-    ("ZERNIO_API_KEY", "Zernio API key (posting to YouTube)", "secret"),
+    ("STYLE_HINT", "Style hint added to every image prompt", "text"),
+    ("STYLE_STRENGTH", "Style strength (0 to 1)", "float"),
+    ("CF_IMAGE_URL", "Cloudflare image worker URL (free fallback)", "text"),
+    ("CF_IMAGE_KEY", "Cloudflare worker key", "secret"),
+    ("SPLIT_IN_TWO", "Split every video into two halves (two separate videos)", "bool"),
+    ("PREVIEW_SECONDS", "Default seconds to rebuild", "int"),
     ("ZERNIO_ACCOUNT_ID", "Zernio YouTube account id (blank = first YouTube account)", "text"),
     ("POST_VISIBILITY", "YouTube visibility: private / unlisted / public", "text"),
     ("AUTO_POST", "Post to YouTube automatically when a build finishes", "bool"),
+    ("REVIEW_ON_FALLBACK", "Never auto-post when a backup voice was used (needs my approval)", "bool"),
     ("MARK_SYNTHETIC", "Tell YouTube the video contains AI / synthetic content", "bool"),
-    ("FISH_API_KEY", "Fish Audio key (optional)", "secret"),
     ("FISH_VOICE_ID", "Fish voice id (optional)", "text"),
-    ("ELEVEN_API_KEY", "ElevenLabs key (optional)", "secret"),
     ("ELEVEN_VOICE_ID", "ElevenLabs voice id", "text"),
     ("ELEVEN_MODEL", "ElevenLabs model", "text"),
-    ("CF_IMAGE_URL", "Cloudflare image worker URL", "text"),
-    ("CF_IMAGE_KEY", "Cloudflare worker key", "secret"),
     ("EDGE_VOICE", "Free Microsoft voice", "text"),
-    ("STYLE_HINT", "Style hint added to every image prompt", "text"),
-    ("STYLE_STRENGTH", "Style strength (0 to 1)", "float"),
-    ("PREVIEW_SECONDS", "Default seconds to rebuild", "int"),
     ("USE_GEMINI_VOICE", "Try the Gemini voice before the free Microsoft voice", "bool"),
+]
+SETTING_GROUPS = [
+    ("Text AI (Groq)", ["USE_GROQ", "GROQ_MODELS", "GROQ_VISION_MODEL", "TEXT_FALLBACK"]),
+    ("Images (Krea)", ["USE_CHEAP_KREA", "KREA_LADDER", "KREA_MODEL", "FRAME_REFS", "STYLE_HINT", "STYLE_STRENGTH",
+                       "CF_IMAGE_URL", "CF_IMAGE_KEY"]),
+    ("Build", ["SPLIT_IN_TWO", "PREVIEW_SECONDS"]),
+    ("Posting (Zernio)", ["AUTO_POST", "POST_VISIBILITY", "REVIEW_ON_FALLBACK", "MARK_SYNTHETIC", "ZERNIO_ACCOUNT_ID"]),
+    ("Voice", ["FISH_VOICE_ID", "ELEVEN_VOICE_ID", "ELEVEN_MODEL", "EDGE_VOICE", "USE_GEMINI_VOICE"]),
 ]
 ENV_DEFAULTS = {k: globals()[k] for k, _, _ in SETTING_FIELDS}
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
@@ -330,6 +327,214 @@ def dir_mb(path):
 
 
 # ---------------------------------------------------------------------------
+# API KEY POOL: several keys per provider (saved on the website + Railway env vars), tried in turn
+# ---------------------------------------------------------------------------
+class KeyFail(RuntimeError):
+    """A key was refused (invalid / out of credit / rate-limited): the next key gets tried."""
+    def __init__(self, msg, kind="invalid", retry=0):
+        super().__init__(msg)
+        self.kind = kind          # invalid | credit | rate
+        self.retry = retry
+
+
+KEY_PROVIDERS = [
+    ("GROQ_API_KEY", "Groq", "Rewrites the narration, writes titles, describes frames (replaces Gemini for text)"),
+    ("GEMINI_API_KEY", "Gemini", "Watches the video (the only step that needs it)"),
+    ("ANTHROPIC_API_KEY", "Anthropic", "Optional text backup"),
+    ("KREA_API_KEY", "Krea API", "Image generation through the API balance (your web credits use Connect Krea)"),
+    ("VIDKRAKEN_API_KEY", "Vid Kraken", "Downloads the source video once (about 10 per day per key)"),
+    ("ZERNIO_API_KEY", "Zernio", "Posts to YouTube"),
+    ("FISH_API_KEY", "Fish Audio", "Voice-over"),
+    ("ELEVEN_API_KEY", "ElevenLabs", "Voice-over"),
+]
+KEY_NAMES = [k for k, _, _ in KEY_PROVIDERS]
+KEY_ENV_ALIASES = {"ELEVEN_API_KEY": ["ELEVENLABS_API_KEY", "ELEVEN_API_KEY"]}
+KEY_COOLDOWN = {"invalid": 43200, "credit": 10800, "rate": 25}
+_key_state = {}
+_key_lock = threading.RLock()
+_tl = threading.local()        # per-thread "current key" for providers whose jobs must stay on one key
+
+
+def _kid(name, key):
+    return name + ":" + hashlib.sha1(key.encode()).hexdigest()[:10]
+
+
+def mask_key(key):
+    return ("····" + key[-4:]) if len(key) > 6 else "····"
+
+
+def env_key_entries(name):
+    found = []
+    for base in KEY_ENV_ALIASES.get(name, [name]):
+        pat = re.compile(r"^" + re.escape(base) + r"(?:_?(\d+))?$")
+        for var, val in os.environ.items():
+            m = pat.match(var)
+            if m and val.strip():
+                num = int(m.group(1)) if m.group(1) else 0
+                for part in re.split(r"[,\s]+", val.strip()):
+                    if part:
+                        found.append((num, var, part))
+    found.sort(key=lambda t: (t[0], t[1]))
+    return [(k, "env " + v) for _, v, k in found]
+
+
+def saved_key_list(name):
+    d = settings_load()
+    out = [k for k in ((d.get("KEYS") or {}).get(name) or []) if isinstance(k, str) and k.strip()]
+    legacy = d.get(name)                       # a key saved by an older version of the bot
+    if isinstance(legacy, str) and legacy.strip():
+        out.append(legacy.strip())
+    return out
+
+
+def key_entries(name):
+    """[(key, source)] - website keys first (newest first), then Railway env keys. Duplicates dropped."""
+    seen, out = set(), []
+    for k in saved_key_list(name):
+        if k not in seen:
+            seen.add(k)
+            out.append((k, "website"))
+    for k, src in env_key_entries(name):
+        if k not in seen:
+            seen.add(k)
+            out.append((k, src))
+    return out
+
+
+def key_list(name):
+    return [k for k, _ in key_entries(name)]
+
+
+def first_key(name):
+    ks = key_list(name)
+    return ks[0] if ks else ""
+
+
+def refresh_key_globals():
+    for name in KEY_NAMES:
+        globals()[name] = first_key(name)
+
+
+def key_ok(name, key):
+    with _key_lock:
+        _key_state[_kid(name, key)] = {"ok": time.time(), "bad_until": 0, "why": "", "kind": ""}
+
+
+def key_bad(name, key, e):
+    cool = (e.retry + 3) if (e.kind == "rate" and e.retry) else KEY_COOLDOWN.get(e.kind, 300)
+    with _key_lock:
+        st = _key_state.setdefault(_kid(name, key), {})
+        st.update(bad_until=time.time() + cool, why=str(e)[:220], kind=e.kind, bad_at=time.time())
+    status(f"🔑 {esc(name)} key {esc(mask_key(key))} failed ({esc(e.kind)}): {esc(str(e)[:110])}"
+           + (" - trying the next key." if len(key_list(name)) > 1 else ""))
+
+
+def key_reset(name=None):
+    with _key_lock:
+        for n in ([name] if name else KEY_NAMES):
+            for k in key_list(n):
+                _key_state.pop(_kid(n, k), None)
+
+
+def with_keys(name, fn):
+    """Call fn(key) with each usable key of this provider until one works (KeyFail = try the next)."""
+    ks = key_list(name)
+    if not ks:
+        raise RuntimeError(f"no {name} - add one on the Keys tab")
+    now = time.time()
+    with _key_lock:
+        order = [k for k in ks if _key_state.get(_kid(name, k), {}).get("bad_until", 0) <= now]
+    if not order:                               # everything is cooling down: try them anyway, soonest first
+        with _key_lock:
+            order = sorted(ks, key=lambda k: _key_state.get(_kid(name, k), {}).get("bad_until", 0))
+    last = None
+    for k in order:
+        check_kill()
+        try:
+            res = fn(k)
+            key_ok(name, k)
+            return res
+        except KeyFail as e:
+            key_bad(name, k, e)
+            last = e
+    raise KeyFail(f"all {len(order)} {name} key(s) failed. Last: {last}", last.kind if last else "invalid",
+                  last.retry if last else 0)
+
+
+def key_check(r, who, limit_codes=(402, 429)):
+    """Turn a provider HTTP error into KeyFail (so the next key is tried). Other errors are left to the caller."""
+    c = r.status_code
+    if c < 400:
+        return
+    txt = (r.text or "")[:300]
+    low = txt.lower()
+    msg = f"{who} {c}: {txt[:140]}"
+    retry = 0
+    try:
+        retry = int(float((getattr(r, "headers", {}) or {}).get("retry-after", 0)))
+    except Exception:
+        pass
+    quota = any(w in low for w in ("quota", "credit", "balance", "billing", "insufficient", "per day", "daily"))
+    if c in limit_codes or (c in (401, 403) and quota):
+        raise KeyFail(msg, "rate" if (c == 429 and not quota) else "credit", retry)
+    if c in (401, 403):
+        raise KeyFail(msg, "invalid")
+
+
+def key_rows(name):
+    now = time.time()
+    rows = []
+    for k, src in key_entries(name):
+        st = _key_state.get(_kid(name, k), {})
+        if st.get("bad_until", 0) > now:
+            status_txt, cls = f"{st.get('kind', 'failed')}: {st.get('why', '')[:90]}", "bad"
+        elif st.get("ok"):
+            status_txt, cls = "worked " + time.strftime("%H:%M", time.localtime(st["ok"])), "ok"
+        else:
+            status_txt, cls = "not used yet", "idle"
+        rows.append({"kid": _kid(name, k), "mask": mask_key(k), "source": src, "status": status_txt, "cls": cls,
+                     "removable": src == "website"})
+    return rows
+
+
+def keys_add(name, key):
+    key = (key or "").strip()
+    if name not in KEY_NAMES or len(key) < 8 or re.search(r"\s", key):
+        raise RuntimeError("that doesn't look like a key (no spaces, at least 8 characters)")
+    d = settings_load()
+    ks = dict(d.get("KEYS") or {})
+    lst = [k for k in ks.get(name, []) if k != key]
+    lst.insert(0, key)                          # newest first
+    ks[name] = lst
+    settings_update({"KEYS": ks})
+    key_reset(name)
+
+
+def keys_remove(name, kid):
+    d = settings_load()
+    ks = dict(d.get("KEYS") or {})
+    ks[name] = [k for k in ks.get(name, []) if _kid(name, k) != kid]
+    ch = {"KEYS": ks}
+    if isinstance(d.get(name), str) and _kid(name, d[name]) == kid:
+        ch[name] = None
+    settings_update(ch)
+
+
+def keys_alerts():
+    """Providers whose every key is currently failing (shown as a banner with a quick fix)."""
+    out = []
+    now = time.time()
+    for name, label, _ in KEY_PROVIDERS:
+        ks = key_list(name)
+        if not ks:
+            continue
+        sts = [_key_state.get(_kid(name, k), {}) for k in ks]
+        if all(s.get("bad_until", 0) > now for s in sts):
+            out.append((name, label, sts[0].get("why", "")))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Persistence: settings.json + optional GitHub backup (for Railway without a volume)
 # ---------------------------------------------------------------------------
 _settings_lock = threading.RLock()
@@ -382,6 +587,7 @@ def settings_update(changes):
             json.dump(d, f, indent=1)
         os.replace(tmp, SETTINGS_FILE)
         apply_settings(d)
+        refresh_key_globals()
     backup_file(SETTINGS_FILE)
 
 
@@ -524,6 +730,7 @@ def init_storage():
     os.makedirs(DATA_DIR, exist_ok=True)
     restore_from_github()
     apply_settings()
+    refresh_key_globals()
     if settings_load().get("PAUSED") == "1":
         PAUSED = True
         kill_event.set()
@@ -876,43 +1083,52 @@ def bank_put(vid, src_path, complete, seconds, how):
 
 
 def vidkraken_download(video_url, dest):
-    """Vid Kraken: submit, poll, stream the file to dest (360p keeps it small; the frames only need 360p)."""
-    hdr = {"Authorization": f"Bearer {VIDKRAKEN_API_KEY}", "Content-Type": "application/json"}
-    r = http("POST", f"{VK_BASE}/download", headers=hdr, json={"url": video_url, "format": "360"}, timeout=60, tries=1)
-    if r.status_code in (402, 403, 429):
-        raise RuntimeError(f"Vid Kraken limit reached ({r.status_code}: {r.text[:120]})")
-    if r.status_code >= 300:
-        raise RuntimeError(f"Vid Kraken {r.status_code}: {r.text[:160]}")
-    j = r.json()
-    job = _find_key(j, ["jobId", "job_id", "id"])
-    if not job:
-        raise RuntimeError(f"Vid Kraken gave no job id: {str(j)[:160]}")
-    t0 = time.time()
-    url = None
-    while time.time() - t0 < 900:
-        check_kill()
-        p = http("GET", f"{VK_BASE}/download/{job}", headers=hdr, timeout=30, tries=2)
-        if p.status_code >= 300:
-            raise RuntimeError(f"Vid Kraken status {p.status_code}: {p.text[:160]}")
-        jj = p.json()
-        url = _find_key(jj, VK_DONE_KEYS)
-        st = str(jj.get("status") or "").upper()
-        if url:
-            break
-        if st in ("FAILED", "ERROR", "CANCELLED", "CANCELED"):
-            raise RuntimeError(f"Vid Kraken job {st}: {str(jj.get('error') or jj.get('errorCode') or jj)[:160]}")
-        time.sleep(3)
-    if not url:
-        raise RuntimeError("Vid Kraken timed out")
-    tmp = dest + ".part"
-    with requests.get(url, stream=True, timeout=120) as resp:
-        if resp.status_code != 200:
-            raise RuntimeError(f"Vid Kraken file download failed ({resp.status_code})")
-        with open(tmp, "wb") as f:
-            for chunk in resp.iter_content(1024 * 1024):
-                check_kill()
-                f.write(chunk)
-    os.replace(tmp, dest)
+    """Vid Kraken: submit, poll, stream the file to dest (360p keeps it small; the frames only need 360p).
+    Several keys are rotated (the free plan is about 10 downloads a day per key)."""
+    def vk_check(r):
+        c = r.status_code
+        if c == 401:
+            raise KeyFail(f"Vid Kraken 401: {r.text[:120]}", "invalid")
+        if c in (402, 403, 429):
+            raise KeyFail(f"Vid Kraken limit reached ({c}: {r.text[:100]})", "credit")
+        if c >= 300:
+            raise RuntimeError(f"Vid Kraken {c}: {r.text[:160]}")
+
+    def go(key):
+        hdr = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        r = http("POST", f"{VK_BASE}/download", headers=hdr, json={"url": video_url, "format": "360"}, timeout=60, tries=1)
+        vk_check(r)
+        j = r.json()
+        job = _find_key(j, ["jobId", "job_id", "id"])
+        if not job:
+            raise RuntimeError(f"Vid Kraken gave no job id: {str(j)[:160]}")
+        t0 = time.time()
+        url = None
+        while time.time() - t0 < 900:
+            check_kill()
+            p = http("GET", f"{VK_BASE}/download/{job}", headers=hdr, timeout=30, tries=2)
+            vk_check(p)
+            jj = p.json()
+            url = _find_key(jj, VK_DONE_KEYS)
+            st = str(jj.get("status") or "").upper()
+            if url:
+                break
+            if st in ("FAILED", "ERROR", "CANCELLED", "CANCELED"):
+                raise RuntimeError(f"Vid Kraken job {st}: {str(jj.get('error') or jj.get('errorCode') or jj)[:160]}")
+            time.sleep(3)
+        if not url:
+            raise RuntimeError("Vid Kraken timed out")
+        tmp = dest + ".part"
+        with requests.get(url, stream=True, timeout=120) as resp:
+            if resp.status_code != 200:
+                raise RuntimeError(f"Vid Kraken file download failed ({resp.status_code})")
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(1024 * 1024):
+                    check_kill()
+                    f.write(chunk)
+        os.replace(tmp, dest)
+
+    with_keys("VIDKRAKEN_API_KEY", go)
 
 
 def get_source_video(vid, seconds, work):
@@ -921,7 +1137,7 @@ def get_source_video(vid, seconds, work):
     if path and (meta.get("complete") or float(meta.get("seconds") or 0) >= seconds - 1):
         status("🏦 Using the source video from the video bank (no download used).")
         return path
-    if VIDKRAKEN_API_KEY:
+    if key_list("VIDKRAKEN_API_KEY"):
         try:
             status("⬇️ Downloading the source video from Vid Kraken (kept in the bank for next time) ...")
             tmp = os.path.join(work, "vk_src.mp4")
@@ -1023,7 +1239,7 @@ def make_frames(src, scenes, unique, framedir):
 
 
 # ---------------------------------------------------------------------------
-# LLM: rewrite narration + describe frames
+# LLM: Gemini (watches the video), Groq (rewrite / titles / frame descriptions), Anthropic (backup)
 # ---------------------------------------------------------------------------
 _gemini_state = {"no_thinking": False, "picked": False}
 
@@ -1031,7 +1247,7 @@ _gemini_state = {"no_thinking": False, "picked": False}
 def pick_gemini_model():
     """Newest plain 'gemini-X-flash' model this key can use."""
     r = http("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
-             headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+             headers={"x-goog-api-key": first_key("GEMINI_API_KEY")}, timeout=30)
     best = None
     for m in (r.json().get("models", []) if r.status_code == 200 else []):
         name = m.get("name", "").split("/")[-1]
@@ -1044,48 +1260,59 @@ def pick_gemini_model():
 
 
 def gemini_call(system, parts, max_tokens=4000, json_mode=False, temperature=0.7, timeout=180):
-    """One Gemini generateContent call. Handles a removed model name and thinking-config differences."""
-    global GEMINI_MODEL
-    r = None
-    for _ in range(4):
-        cfg = {"maxOutputTokens": max_tokens, "temperature": temperature}
-        if json_mode:
-            cfg["responseMimeType"] = "application/json"
-        if "flash" in GEMINI_MODEL and not _gemini_state["no_thinking"]:
-            cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no hidden thinking tokens
-        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}
-        if system:
-            body["systemInstruction"] = {"parts": [{"text": system}]}
-        r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
-                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                 json=body, timeout=timeout, tries=5)
-        if r.status_code == 404 and not _gemini_state["picked"]:
-            _gemini_state["picked"] = True
-            newm = pick_gemini_model()
-            if newm and newm != GEMINI_MODEL:
-                status(f"ℹ️ Gemini model {esc(GEMINI_MODEL)} isn't available, switching to {esc(newm)}.")
-                GEMINI_MODEL = newm
+    """One Gemini generateContent call. Rotates through your Gemini keys; handles a removed model name."""
+    multi = len(key_list("GEMINI_API_KEY")) > 1
+
+    def go(key):
+        global GEMINI_MODEL
+        r = None
+        for _ in range(4):
+            cfg = {"maxOutputTokens": max_tokens, "temperature": temperature}
+            if json_mode:
+                cfg["responseMimeType"] = "application/json"
+            if "flash" in GEMINI_MODEL and not _gemini_state["no_thinking"]:
+                cfg["thinkingConfig"] = {"thinkingBudget": 0}      # no hidden thinking tokens
+            body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}
+            if system:
+                body["systemInstruction"] = {"parts": [{"text": system}]}
+            r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
+                     headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                     json=body, timeout=timeout, tries=1 if multi else 5)
+            if r.status_code == 404 and not _gemini_state["picked"]:
+                _gemini_state["picked"] = True
+                newm = pick_gemini_model()
+                if newm and newm != GEMINI_MODEL:
+                    status(f"ℹ️ Gemini model {esc(GEMINI_MODEL)} isn't available, switching to {esc(newm)}.")
+                    GEMINI_MODEL = newm
+                    continue
+            if r.status_code == 400 and "thinking" in r.text.lower() and not _gemini_state["no_thinking"]:
+                _gemini_state["no_thinking"] = True
                 continue
-        if r.status_code == 400 and "thinking" in r.text.lower() and not _gemini_state["no_thinking"]:
-            _gemini_state["no_thinking"] = True
-            continue
-        break
-    if r.status_code != 200:
-        raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:250]}")
-    j = r.json()
-    cands = j.get("candidates") or []
-    if not cands:
-        raise RuntimeError(f"Gemini returned nothing: {str(j.get('promptFeedback', j))[:200]}")
-    out = "".join(p.get("text", "") for p in (cands[0].get("content") or {}).get("parts", [])).strip()
-    if not out:
-        raise RuntimeError(f"Gemini returned empty text (finish: {cands[0].get('finishReason')})")
-    return out
+            break
+        low = r.text.lower()
+        if r.status_code in (400, 401) and ("api key" in low or "api_key" in low):
+            raise KeyFail(f"Gemini {r.status_code}: {r.text[:140]}", "invalid")
+        if r.status_code == 403 and ("api key" in low or "billing" in low or "leaked" in low):
+            raise KeyFail(f"Gemini 403: {r.text[:140]}", "invalid")
+        if r.status_code == 429:
+            key_check(r, "Gemini")
+        if r.status_code != 200:
+            raise RuntimeError(f"Gemini API {r.status_code}: {r.text[:250]}")
+        j = r.json()
+        cands = j.get("candidates") or []
+        if not cands:
+            raise RuntimeError(f"Gemini returned nothing: {str(j.get('promptFeedback', j))[:200]}")
+        out = "".join(p.get("text", "") for p in (cands[0].get("content") or {}).get("parts", [])).strip()
+        if not out:
+            raise RuntimeError(f"Gemini returned empty text (finish: {cands[0].get('finishReason')})")
+        return out
+
+    return with_keys("GEMINI_API_KEY", go)
 
 
 def llm(system, text, max_tokens=4000, image_b64=None):
-    """One text (optionally + one JPEG image) in, text out. Uses Gemini (free tier ok)
-    if GEMINI_API_KEY is set, otherwise Anthropic."""
-    if GEMINI_API_KEY:
+    """One text (optionally + one JPEG image) in, text out. Gemini if it has a key, otherwise Anthropic."""
+    if key_list("GEMINI_API_KEY"):
         parts = [{"text": text}]
         if image_b64:
             parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
@@ -1093,14 +1320,101 @@ def llm(system, text, max_tokens=4000, image_b64=None):
     content = [{"type": "text", "text": text}]
     if image_b64:
         content.insert(0, {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}})
-    r = http("POST", "https://api.anthropic.com/v1/messages",
-             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
-                      "content-type": "application/json"},
-             json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": system,
-                   "messages": [{"role": "user", "content": content}]}, timeout=180)
-    if r.status_code != 200:
-        raise RuntimeError(f"Claude API {r.status_code}: {r.text[:200]}")
-    return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+
+    def go(key):
+        r = http("POST", "https://api.anthropic.com/v1/messages",
+                 headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                 json={"model": CLAUDE_MODEL, "max_tokens": max_tokens, "system": system,
+                       "messages": [{"role": "user", "content": content}]}, timeout=180, tries=2)
+        key_check(r, "Anthropic")
+        if r.status_code != 200:
+            raise RuntimeError(f"Claude API {r.status_code}: {r.text[:200]}")
+        return "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+
+    return with_keys("ANTHROPIC_API_KEY", go)
+
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _groq_once(model, messages, max_tokens, temperature):
+    def go(key):
+        r = http("POST", GROQ_URL, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                 json={"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
+                 timeout=180, tries=1)
+        low = r.text.lower()
+        if r.status_code in (400, 404, 413) and ("model" in low or "decommission" in low or "too large" in low):
+            raise ModelRejected(f"Groq model {model}: {r.text[:140]}")
+        key_check(r, "Groq")
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq {r.status_code}: {r.text[:200]}")
+        txt = (((r.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        if not txt:
+            raise RuntimeError("Groq returned empty text")
+        return txt
+    return with_keys("GROQ_API_KEY", go)
+
+
+def groq_chat(system, user, max_tokens=3000, temperature=0.6, image_b64=None):
+    """Groq chat completion: every key x every model in the list (each model has its own rate limit)."""
+    if image_b64:
+        models = [GROQ_VISION_MODEL.strip()] if GROQ_VISION_MODEL.strip() else []
+        content = [{"type": "text", "text": user},
+                   {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + image_b64}}]
+    else:
+        models = [m.strip() for m in GROQ_MODELS.split(",") if m.strip()]
+        content = user
+    if not models:
+        raise RuntimeError("no Groq model set")
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": content}]
+    last = None
+    for attempt in range(3):
+        wait = 0
+        for model in models:
+            try:
+                return _groq_once(model, messages, max_tokens, temperature)
+            except ModelRejected as e:
+                last = e
+            except KeyFail as e:
+                last = e
+                if e.kind != "rate":
+                    raise
+                wait = max(wait, e.retry or 10)
+        if wait and attempt < 2:
+            wait = min(wait, 40)
+            status(f"⏳ Groq is rate-limiting, waiting {wait}s ...")
+            for _ in range(int(wait)):
+                check_kill()
+                time.sleep(1)
+            continue
+        break
+    raise last or RuntimeError("Groq failed")
+
+
+def llm_text(system, text, max_tokens=3000):
+    """Text-only AI call: Groq first (cheap), Gemini/Anthropic as the backup if you allow it."""
+    if USE_GROQ and key_list("GROQ_API_KEY"):
+        try:
+            return groq_chat(system, text, max_tokens)
+        except Exception as e:
+            print(f"Groq text failed: {e}", flush=True)
+            if not (TEXT_FALLBACK and (key_list("GEMINI_API_KEY") or key_list("ANTHROPIC_API_KEY"))):
+                raise
+            status(f"⚠️ Groq failed ({esc(str(e)[:120])}) - using Gemini/Anthropic for this step.")
+    return llm(system, text, max_tokens)
+
+
+def llm_vision(system, text, image_b64, max_tokens=400):
+    """One image + text in, text out: Groq vision first, Gemini/Anthropic as the backup."""
+    if USE_GROQ and key_list("GROQ_API_KEY") and GROQ_VISION_MODEL.strip():
+        try:
+            return groq_chat(system, text, max_tokens, image_b64=image_b64)
+        except Exception as e:
+            print(f"Groq vision failed: {e}", flush=True)
+            if not (TEXT_FALLBACK and (key_list("GEMINI_API_KEY") or key_list("ANTHROPIC_API_KEY"))):
+                raise
+            status(f"⚠️ Groq vision failed ({esc(str(e)[:100])}) - using Gemini/Anthropic for this frame.")
+    return llm(system, text, max_tokens, image_b64=image_b64)
 
 
 WATCH_PROMPT = """Watch this video from the start. Split the first {N} seconds into scenes: begin a new scene whenever
@@ -1258,13 +1572,13 @@ def parse_json_obj(text):
 
 def rewrite_scenes(scenes, title):
     new = {}
-    for start in range(0, len(scenes), 30):
+    for start in range(0, len(scenes), 15):
         check_kill()
-        chunk = [{"id": i, "text": scenes[i][2]} for i in range(start, min(start + 30, len(scenes)))]
+        chunk = [{"id": i, "text": scenes[i][2]} for i in range(start, min(start + 15, len(scenes)))]
         msg = f"Video title (context only): {title}\n\n{json.dumps(chunk, ensure_ascii=False)}"
         for attempt in range(2):
             try:
-                for d in parse_json_list(llm(REWRITE_SYSTEM, msg, 8000)):
+                for d in parse_json_list(llm_text(REWRITE_SYSTEM, msg, 6000)):
                     new[int(d["id"])] = str(d["text"]).strip()
                 break
             except (ValueError, KeyError, json.JSONDecodeError) as e:
@@ -1277,7 +1591,7 @@ def make_metadata(new_text, src_title):
     """Title / description / tags for the upload (falls back to plain values if the AI fails)."""
     script = " ".join(new_text)[:6000]
     try:
-        d = parse_json_obj(llm(META_SYSTEM, f"Source video title (context only): {src_title}\n\nScript:\n{script}", 1500))
+        d = parse_json_obj(llm_text(META_SYSTEM, f"Source video title (context only): {src_title}\n\nScript:\n{script}", 1500))
         title = re.sub(r"\s+", " ", str(d.get("title") or "")).strip()[:100]
         desc = str(d.get("description") or "").strip()[:4900]
         tags = [re.sub(r"\s+", " ", str(t)).strip().lstrip("#")[:100] for t in (d.get("tags") or []) if str(t).strip()]
@@ -1297,10 +1611,10 @@ supplies it). Do not name real people; use generic characters. Output ONLY the p
 
 def describe_frame(frame_path, narration):
     if not frame_path:     # couldn't watch the video: draw from the narration alone
-        return llm(DESCRIBE_TEXT_SYSTEM, f"Narration: {narration[:500]}", 300)
+        return llm_text(DESCRIBE_TEXT_SYSTEM, f"Narration: {narration[:500]}", 300)
     with open(frame_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
-    return llm(DESCRIBE_SYSTEM, f"Narration for this scene: {narration[:400]}", 300, image_b64=b64)
+    return llm_vision(DESCRIBE_SYSTEM, f"Narration for this scene: {narration[:400]}", b64, 300)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1636,7 @@ def ladder_models():
 
 
 def krea_headers():
-    return {"Authorization": f"Bearer {KREA_API_KEY}"}
+    return {"Authorization": f"Bearer {getattr(_tl, 'krea_key', None) or first_key('KREA_API_KEY')}"}
 
 
 def _data_uri(path):
@@ -1335,15 +1649,17 @@ _asset_url = {}
 
 
 def krea_asset_url(p):
-    """Upload an image to Krea once, return its URL."""
+    """Upload an image to Krea once (per key), return its URL."""
     if not p:
         return ""
-    key = (p, os.path.getmtime(p))
+    key = (p, os.path.getmtime(p), getattr(_tl, 'krea_key', None))
     if key not in _asset_url:
         with open(p, "rb") as f:
             r = http("POST", f"{KREA_BASE}/assets", headers=krea_headers(),
                      files={"file": (os.path.basename(p), f, mimetypes.guess_type(p)[0] or "image/png")},
                      data={"description": "reference"})
+        if r.status_code in (401, 402, 429) or (r.status_code == 403 and "model" not in r.text.lower()):
+            key_check(r, "Krea")
         if r.status_code >= 300:
             raise RuntimeError(f"Krea asset upload failed: {r.status_code} {r.text[:200]}")
         _asset_url[key] = r.json()["image_url"]
@@ -1392,7 +1708,9 @@ def krea_image(model, prompt, ref_url, frame_url, dest):
         tries.append((False, base))
         for k, body in tries:
             r = http("POST", f"{KREA_BASE}/generate/image/{model}", headers=krea_headers(), json=body, timeout=60)
-            if r.status_code in (400, 404, 422):
+            if r.status_code in (401, 402, 429) or (r.status_code == 403 and not any(w in r.text.lower() for w in ("model", "plan", "upgrade", "access", "not available"))):
+                key_check(r, "Krea")
+            if r.status_code in (400, 403, 404, 422):
                 err = f"{r.status_code} {r.text[:200]}"
                 continue
             if r.status_code >= 300:
@@ -1412,31 +1730,48 @@ def krea_image(model, prompt, ref_url, frame_url, dest):
     raise ModelRejected(f"Krea rejected {model}: {err}")
 
 
+def krea_image_keyed(model, prompt, frame_path, dest):
+    """krea_image with key rotation (a Krea job is polled with the same key that created it)."""
+    def go(key):
+        _tl.krea_key = key
+        try:
+            krea_image(model, prompt, krea_reference_url(), krea_asset_url(frame_path) if frame_path else "", dest)
+        finally:
+            _tl.krea_key = None
+    with_keys("KREA_API_KEY", go)
+
+
 # ---------------------------------------------------------------------------
 # Voice-over: Fish Audio -> ElevenLabs -> (Gemini, optional) -> free Microsoft voice
 # ---------------------------------------------------------------------------
 def fish_tts(text, dest):
-    body = {"text": text, "format": "mp3"}
-    if FISH_VOICE_ID:
-        body["reference_id"] = FISH_VOICE_ID
-    r = http("POST", "https://api.fish.audio/v1/tts",
-             headers={"Authorization": f"Bearer {FISH_API_KEY}", "Content-Type": "application/json",
-                      "model": FISH_MODEL}, json=body, timeout=180)
-    if r.status_code != 200:
-        raise RuntimeError(f"Fish Audio {r.status_code}: {r.text[:200]}")
-    with open(dest, "wb") as f:
-        f.write(r.content)
+    def go(key):
+        body = {"text": text, "format": "mp3"}
+        if FISH_VOICE_ID:
+            body["reference_id"] = FISH_VOICE_ID
+        r = http("POST", "https://api.fish.audio/v1/tts",
+                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                          "model": FISH_MODEL}, json=body, timeout=180, tries=2)
+        key_check(r, "Fish Audio")
+        if r.status_code != 200:
+            raise RuntimeError(f"Fish Audio {r.status_code}: {r.text[:200]}")
+        with open(dest, "wb") as f:
+            f.write(r.content)
+    with_keys("FISH_API_KEY", go)
 
 
 def eleven_tts(text, dest):
     """ElevenLabs voice-over (mp3)."""
-    r = http("POST", f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}?output_format=mp3_44100_128",
-             headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
-             json={"text": text, "model_id": ELEVEN_MODEL}, timeout=180)
-    if r.status_code != 200:
-        raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:200]}")
-    with open(dest, "wb") as f:
-        f.write(r.content)
+    def go(key):
+        r = http("POST", f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}?output_format=mp3_44100_128",
+                 headers={"xi-api-key": key, "Content-Type": "application/json"},
+                 json={"text": text, "model_id": ELEVEN_MODEL}, timeout=180, tries=2)
+        key_check(r, "ElevenLabs")
+        if r.status_code != 200:
+            raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:200]}")
+        with open(dest, "wb") as f:
+            f.write(r.content)
+    with_keys("ELEVEN_API_KEY", go)
 
 
 def edge_tts_save(text, dest):
@@ -1462,7 +1797,7 @@ def edge_tts_save(text, dest):
 
 def pick_tts_model():
     r = http("GET", "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
-             headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=30)
+             headers={"x-goog-api-key": first_key("GEMINI_API_KEY")}, timeout=30)
     names = sorted(m.get("name", "").split("/")[-1] for m in (r.json().get("models", []) if r.status_code == 200 else [])
                    if "tts" in m.get("name", "") and "generateContent" in m.get("supportedGenerationMethods", []))
     return names[-1] if names else None
@@ -1477,7 +1812,7 @@ def gemini_tts(text, dest):
     r = None
     for _ in range(2):
         r = http("POST", f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_TTS_MODEL}:generateContent",
-                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                 headers={"x-goog-api-key": first_key("GEMINI_API_KEY"), "Content-Type": "application/json"},
                  json=body, timeout=180, tries=6)
         if r.status_code == 404:
             m = pick_tts_model()
@@ -1506,20 +1841,20 @@ def gemini_tts(text, dest):
 
 
 def voice_sig():
-    return "|".join([str(bool(FISH_API_KEY)), FISH_VOICE_ID, str(bool(ELEVEN_API_KEY)), ELEVEN_VOICE_ID,
+    return "|".join([str(bool(key_list("FISH_API_KEY"))), FISH_VOICE_ID, str(bool(key_list("ELEVEN_API_KEY"))), ELEVEN_VOICE_ID,
                      ELEVEN_MODEL, EDGE_VOICE, str(USE_GEMINI_VOICE)])
 
 
 def make_voiceovers(texts, audios):
-    """Try the voices in order. The first that voices EVERY line wins. If a voice fails on the first
-    line or runs out part-way, all lines are redone with the next voice (so the voice never changes
-    halfway through the video)."""
+    """Returns (voice name, used_backup). Try the voices in order. The first that voices EVERY line wins.
+    If a voice fails on the first line or runs out part-way, all lines are redone with the next voice
+    (so the voice never changes halfway through the video)."""
     options = []
-    if FISH_API_KEY:
+    if key_list("FISH_API_KEY"):
         options.append(("Fish Audio", fish_tts, WORKERS))
-    if ELEVEN_API_KEY:
+    if key_list("ELEVEN_API_KEY"):
         options.append(("ElevenLabs", eleven_tts, 2))
-    if GEMINI_API_KEY and USE_GEMINI_VOICE:
+    if key_list("GEMINI_API_KEY") and USE_GEMINI_VOICE:
         options.append(("Gemini voice (free)", gemini_tts, 1))
     options.append(("free Microsoft voice", edge_tts_save, WORKERS))
     for k, (name, fn, workers) in enumerate(options):
@@ -1541,7 +1876,7 @@ def make_voiceovers(texts, audios):
                 raise
             status(f"⚠️ {name} ran out mid-way ({esc(str(e)[:80])}). Redoing all lines with the next voice ...")
             continue
-        return name
+        return name, k > 0           # k > 0 = a backup voice had to be used
 
 
 # ---------------------------------------------------------------------------
@@ -1564,7 +1899,7 @@ def scene_clip(img, audio, idx, dst):
           f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={OUT_W}x{OUT_H}:fps={FPS},format=yuv420p[v];"
           f"[1:a]aresample=44100,apad[a]")
     run_ffmpeg(["ffmpeg", "-y", "-i", img, "-i", audio, "-filter_complex", fc,
-                "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+                "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-profile:v", "high", "-preset", "veryfast", "-crf", "22",
                 "-threads", FFMPEG_THREADS, "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
                 "-t", f"{d:.3f}", "-movflags", "+faststart", dst], f"scene {idx + 1}")
 
@@ -1578,10 +1913,42 @@ def concat(parts, out_path, workdir):
                 "-movflags", "+faststart", out_path], "join scenes")
 
 
+def verify_video(path):
+    """(ok, note): H.264 video + AAC audio, yuv420p, sane duration - i.e. something every phone and browser plays."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,pix_fmt",
+                            "-show_entries", "format=duration,size", "-of", "json", path],
+                           capture_output=True, text=True, timeout=60)
+        j = json.loads(r.stdout or "{}")
+    except Exception as e:
+        return False, f"ffprobe failed: {e}"
+    st = j.get("streams") or []
+    v = next((s for s in st if s.get("codec_type") == "video"), None)
+    a = next((s for s in st if s.get("codec_type") == "audio"), None)
+    dur = float((j.get("format") or {}).get("duration") or 0)
+    size = int((j.get("format") or {}).get("size") or 0)
+    if not v or v.get("codec_name") != "h264" or v.get("pix_fmt") != "yuv420p":
+        return False, f"video stream is {v.get('codec_name') if v else 'missing'}/{v.get('pix_fmt') if v else '-'}"
+    if not a or a.get("codec_name") != "aac":
+        return False, f"audio stream is {a.get('codec_name') if a else 'missing'}"
+    if dur < 1 or size < 10_000:
+        return False, f"too short or tiny ({dur:.1f}s, {size} bytes)"
+    return True, f"H.264 + AAC, {int(dur // 60)}:{int(dur % 60):02d}, {size / 1_000_000:.1f} MB"
+
+
+def concat_reencode(parts, out_path, workdir):
+    """Safety net if the stream-copy join isn't clean: re-encode everything into one standard MP4."""
+    lst = os.path.join(workdir, "list.txt")
+    run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c:v", "libx264", "-profile:v", "high",
+                "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-threads", FFMPEG_THREADS,
+                "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2", "-movflags", "+faststart", out_path],
+               "re-encode join")
+
+
 def check_setup():
-    missing = [] if (KREA_API_KEY or CF_IMAGE_URL or krea_connected()) else ["KREA_API_KEY, CF_IMAGE_URL or a Krea connection"]
-    if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
-        missing.insert(0, "GEMINI_API_KEY (free at aistudio.google.com)")
+    missing = [] if (key_list("KREA_API_KEY") or CF_IMAGE_URL or krea_connected()) else ["a Krea key, CF_IMAGE_URL or a Krea connection"]
+    if not (key_list("GEMINI_API_KEY") or key_list("ANTHROPIC_API_KEY")):
+        missing.insert(0, "a Gemini key (free at aistudio.google.com) - it watches the video")
     if missing:
         raise RuntimeError("missing settings: " + ", ".join(missing))
     for tool in ("ffmpeg", "ffprobe"):
@@ -1589,9 +1956,11 @@ def check_setup():
             raise RuntimeError(f"{tool} is not installed")
     if not reference_path():
         status("ℹ️ No style reference image uploaded - images will use Krea's default look.")
-    if AUTO_POST and not ZERNIO_API_KEY:
+    if USE_GROQ and not key_list("GROQ_API_KEY"):
+        status("ℹ️ No Groq key - text steps use Gemini/Anthropic. Add a Groq key on the Keys tab to save Gemini credits.")
+    if AUTO_POST and not key_list("ZERNIO_API_KEY"):
         status("⚠️ Auto-post is ON but there is no Zernio API key - the video will be built but not posted.")
-    if FRAME_REFS and not (VIDKRAKEN_API_KEY or cookies_path()):
+    if FRAME_REFS and not (key_list("VIDKRAKEN_API_KEY") or cookies_path()):
         status("ℹ️ Frame references need a Vid Kraken key (or YouTube cookies) to download the video - otherwise text-only.")
 
 
@@ -2095,7 +2464,7 @@ def krea_test():
             status("🧪 Connected. Krea tools: " + esc(", ".join(_mcp["tools"]) or "none"))
             ids_ = krea_list_models(_mcp["tools"])
             status("🧪 Models Krea lists: " + (esc(", ".join(ids_[:40])) if ids_ else "none found (raw reply is in the Railway logs)"))
-        elif not KREA_API_KEY:
+        elif not key_list("KREA_API_KEY"):
             raise RuntimeError("connect Krea or add a Krea API key first")
         fr = reference_path()
         for m in ladder_models():
@@ -2107,8 +2476,7 @@ def krea_test():
                                    dest, None if m == KREA_MODEL else m, _data_uri(fr) if fr else None)
                     fk = _mcp_frame.get(m, {}).get("on")
                 else:
-                    krea_image(m, "a friendly cartoon caveman sitting by a campfire at night", krea_reference_url(),
-                               krea_asset_url(fr) if fr else "", dest)
+                    krea_image_keyed(m, "a friendly cartoon caveman sitting by a campfire at night", fr or None, dest)
                     fk = _kstate.get(m, {}).get("frame")
                 status(f'✅ {esc(m)} works with your style image; frame reference: {"yes" if fk else "no"}. '
                        f'<a href="/out/{os.path.basename(dest)}" target="_blank">test image</a>')
@@ -2132,18 +2500,18 @@ def krea_card():
             extra = ('<details style="margin-top:12px"><summary>Keep it after redeploys (no storage set up)</summary><div class="sb">'
                      'Best fix: add a Railway volume or set BACKUP_REPO. Otherwise paste this into the '
                      '<code>KREA_OAUTH_BLOB</code> env var. It is a secret login, keep it private.'
-                     f'<textarea readonly rows="4" style="width:100%;margin-top:8px;background:#08080d;color:#eaeaf2;border:1px solid #26263a;border-radius:8px">{esc(krea_blob())}</textarea>'
+                     f'<textarea readonly rows="4" style="margin-top:8px">{esc(krea_blob())}</textarea>'
                      '</div></details>')
         return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
-                '&#9989; Connected. Images use your normal Krea compute credits first. '
+                '✅ Connected. Images use your normal Krea compute credits first. '
                 'Model order: ' + esc(" → ".join(ladder_models())) + '</div>'
-                '<form method="POST" action="/krea/test" style="display:inline"><button type="submit">Test the model ladder</button></form> '
-                '<form method="POST" action="/krea/disconnect" style="display:inline"><button type="submit" style="background:#26263a">Disconnect</button></form>'
+                '<div class="acts"><form method="POST" action="/krea/test" style="display:inline"><button type="submit">Test the model ladder</button></form> '
+                '<form method="POST" action="/krea/disconnect" style="display:inline"><button class="ghost" type="submit">Disconnect</button></form></div>'
                 + extra + '</div>')
     return ('<div class="card"><h2>Krea (your web credits)</h2><div class="hint" style="margin:0 0 8px">'
             'Not connected. Sign in once so the bot can spend your normal Krea credits. On the Krea screen, '
             'pick the workspace that has the credits.</div>'
-            '<a href="/krea/connect"><button type="button">Connect Krea</button></a></div>')
+            '<a class="btn" href="/krea/connect">Connect Krea</a></div>')
 
 
 def cf_image(prompt, dest):
@@ -2178,15 +2546,14 @@ def make_images(unique, prompts, imgdir, frames=None):
 
     def mk_api(m):
         def fn(i, d):
-            fr = frames.get(i)
-            krea_image(m, hint(prompts[i]), krea_reference_url(), krea_asset_url(fr) if fr else "", d)
+            krea_image_keyed(m, hint(prompts[i]), frames.get(i), d)
         return fn
 
     options = []          # (label, fn, workers, route)
     if krea_connected():
         for m in ladder_models():
             options.append((f"Krea credits · {m}", mk_mcp(m), WORKERS, "mcp"))
-    if KREA_API_KEY:
+    if key_list("KREA_API_KEY"):
         for m in ladder_models():
             options.append((f"Krea API · {m}", mk_api(m), WORKERS, "api"))
     if CF_IMAGE_URL:
@@ -2217,7 +2584,7 @@ def make_images(unique, prompts, imgdir, frames=None):
                 raise
             continue
         except Exception as e:
-            if "402" in str(e) and route != "cf":
+            if (isinstance(e, KeyFail) or "402" in str(e)) and route != "cf":
                 dead.add(route)
             if last:
                 raise
@@ -2230,7 +2597,7 @@ def make_images(unique, prompts, imgdir, frames=None):
             with ThreadPoolExecutor(workers) as ex:
                 list(ex.map(lambda i: fn(i, dest(i)), unique[1:]))
         except Exception as e:
-            if isinstance(e, OutOfCredit):
+            if isinstance(e, (OutOfCredit, KeyFail)):
                 dead.add(route)
             if last:
                 raise
@@ -2271,11 +2638,11 @@ def last_job_dir():
         return ""
 
 
-def reset_job(jd, vid):
+def reset_job(jd, vid, part=None):
     shutil.rmtree(jd, ignore_errors=True)
     os.makedirs(os.path.join(jd, "audio"), exist_ok=True)
     os.makedirs(os.path.join(jd, "images"), exist_ok=True)
-    jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"], "id": vid["id"]})
+    jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"], "id": vid["id"], "part": list(part) if part else [1, 1]})
 
 
 def video_length(video_url):
@@ -2295,7 +2662,7 @@ def video_length(video_url):
             return int(d)
     except Exception as e:
         print(f"length via yt-dlp failed: {e}", flush=True)
-    if GEMINI_API_KEY:
+    if key_list("GEMINI_API_KEY"):
         try:
             out = gemini_call("", [{"file_data": {"file_uri": video_url}},
                                    {"text": "How long is this video in seconds? Reply with only the number."}],
@@ -2306,6 +2673,25 @@ def video_length(video_url):
         except Exception as e:
             print(f"length via Gemini failed: {e}", flush=True)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Review gate: a video made with a backup voice never auto-posts until you watched it and pressed Approve
+# ---------------------------------------------------------------------------
+def review_reasons(jd):
+    out = []
+    vo = jread(jd, "voice.json") or {}
+    if REVIEW_ON_FALLBACK and vo.get("fallback"):
+        out.append(f"a backup voice ({vo.get('name')}) was used because your main voice failed")
+    return out
+
+
+def is_approved(jd):
+    return bool(jread(jd, "approved.json"))
+
+
+def is_viewed(jd):
+    return bool(jread(jd, "viewed.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -2340,12 +2726,16 @@ def build_thumbnail(vid, jd):
     return out
 
 
-def build_extras(vid, jd, new_text):
+def build_extras(vid, jd, new_text, part=(1, 1)):
     """Upload details + thumbnail. A failure here never kills the build (YouTube just picks its own thumbnail)."""
     if not jread(jd, "meta.json"):
         try:
             status("📝 Writing the title, description and tags ...")
-            jwrite(jd, "meta.json", make_metadata(new_text, vid["title"]))
+            meta = make_metadata(new_text, vid["title"])
+            if part[1] > 1:
+                suf = f" (Part {part[0]}/{part[1]})"
+                meta["title"] = meta["title"][:100 - len(suf)] + suf
+            jwrite(jd, "meta.json", meta)
         except Exception as e:
             status(f"⚠️ Couldn't write the upload details: {esc(str(e)[:160])}")
     if not os.path.isfile(os.path.join(jd, "thumbnail.jpg")):
@@ -2359,7 +2749,7 @@ def build_extras(vid, jd, new_text):
 
 
 # ---------------------------------------------------------------------------
-# Posting to YouTube through Zernio
+# Posting to YouTube through Zernio (key pool: if one Zernio key is refused the next is tried)
 # ---------------------------------------------------------------------------
 ZERNIO = "https://zernio.com/api/v1"
 post_lock = threading.Lock()
@@ -2367,13 +2757,15 @@ post_running = False
 
 
 def zernio_headers():
-    return {"Authorization": f"Bearer {ZERNIO_API_KEY}", "Content-Type": "application/json"}
+    key = getattr(_tl, "zernio_key", None) or first_key("ZERNIO_API_KEY")
+    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
 def zernio_account():
     if ZERNIO_ACCOUNT_ID:
         return ZERNIO_ACCOUNT_ID.strip()
     r = http("GET", f"{ZERNIO}/accounts", headers=zernio_headers(), timeout=30, tries=2)
+    key_check(r, "Zernio")
     if r.status_code != 200:
         raise RuntimeError(f"Zernio accounts {r.status_code}: {r.text[:160]}")
     for d in _walk(r.json()):
@@ -2390,6 +2782,8 @@ def zernio_upload(path, ctype):
     j, err = None, ""
     for body in ({"filename": name, "contentType": ctype}, {"fileName": name, "fileType": ctype}):
         r = http("POST", f"{ZERNIO}/media/presign", headers=zernio_headers(), json=body, timeout=60, tries=1)
+        if r.status_code in (401, 403, 429):
+            key_check(r, "Zernio")
         if r.status_code in (200, 201):
             j = r.json()
             break
@@ -2407,29 +2801,7 @@ def zernio_upload(path, ctype):
     return pub
 
 
-def post_to_youtube():
-    """Post the finished video of the job on screen. NOT made for kids. Never posts the same job twice."""
-    check_kill()
-    if PAUSED:
-        raise RuntimeError("the bot is paused (kill switch)")
-    if not ZERNIO_API_KEY:
-        raise RuntimeError("add your Zernio API key in Settings first")
-    jd = last_job_dir()
-    video = os.path.join(jd, "final.mp4") if jd else ""
-    if not jd or not jread(jd, "done.json") or not os.path.isfile(video):
-        raise RuntimeError("there is no finished video to post yet")
-    already = jread(jd, "posted.json")
-    if already:
-        status(f'ℹ️ Already posted: <a href="{esc(already.get("url"))}" target="_blank">{esc(already.get("url") or "see Zernio")}</a> '
-               '(use "Start fresh" on the same video to build and post a new one).')
-        return already
-    meta = jread(jd, "meta.json")
-    if not meta:
-        meta = make_metadata((jread(jd, "rewrite.json") or {}).get("text") or [], (jread(jd, "video.json") or {}).get("title", ""))
-        jwrite(jd, "meta.json", meta)
-    vis = POST_VISIBILITY.strip().lower()
-    vis = vis if vis in ("private", "unlisted", "public") else "private"
-
+def _do_post(jd, video, meta, vis):
     status("🚀 Posting to YouTube: finding your channel in Zernio ...")
     acc = zernio_account()
     status("🚀 Uploading the video to Zernio ...")
@@ -2440,6 +2812,8 @@ def post_to_youtube():
         status("🚀 Uploading the thumbnail ...")
         try:
             item["thumbnail"] = zernio_upload(thumb, "image/jpeg")
+        except KeyFail:
+            raise
         except Exception as e:
             status(f"⚠️ Thumbnail upload failed ({esc(str(e)[:120])}) - posting without a custom thumbnail.")
     check_kill()
@@ -2454,6 +2828,8 @@ def post_to_youtube():
             "publishNow": True}
     status(f"🚀 Creating the YouTube post ({vis}) ...")
     r = http("POST", f"{ZERNIO}/posts", headers=zernio_headers(), json=body, timeout=600, tries=1)
+    if r.status_code in (401, 429) or (r.status_code == 403 and "suspend" not in r.text.lower()):
+        key_check(r, "Zernio")
     try:
         j = r.json()
     except ValueError:
@@ -2471,6 +2847,44 @@ def post_to_youtube():
     status(f'✅ Posted to YouTube ({esc(vis)}, status: {esc(st or "sent")}): '
            + (f'<a href="{esc(url)}" target="_blank">{esc(url)}</a>' if url else "the link appears in your Zernio dashboard when YouTube finishes processing."))
     return jread(jd, "posted.json")
+
+
+def post_to_youtube(jd=None):
+    """Post a finished video. NOT made for kids. Never posts the same job twice, and never posts a video that
+    still needs your approval (backup voice used) until you watched it and pressed Approve."""
+    check_kill()
+    if PAUSED:
+        raise RuntimeError("the bot is paused (kill switch)")
+    if not key_list("ZERNIO_API_KEY"):
+        raise RuntimeError("add your Zernio API key on the Keys tab first")
+    jd = jd or last_job_dir()
+    video = os.path.join(jd, "final.mp4") if jd else ""
+    if not jd or not jread(jd, "done.json") or not os.path.isfile(video):
+        raise RuntimeError("there is no finished video to post yet")
+    already = jread(jd, "posted.json")
+    if already:
+        status(f'ℹ️ Already posted: <a href="{esc(already.get("url"))}" target="_blank">{esc(already.get("url") or "see Zernio")}</a> '
+               '(use "Start fresh" on the same video to build and post a new one).')
+        return already
+    reasons = review_reasons(jd)
+    if reasons and not is_approved(jd):
+        raise RuntimeError("needs your approval first: " + "; ".join(reasons) +
+                           ". Watch it on the Results tab, press Approve, then post.")
+    meta = jread(jd, "meta.json")
+    if not meta:
+        meta = make_metadata((jread(jd, "rewrite.json") or {}).get("text") or [], (jread(jd, "video.json") or {}).get("title", ""))
+        jwrite(jd, "meta.json", meta)
+    vis = POST_VISIBILITY.strip().lower()
+    vis = vis if vis in ("private", "unlisted", "public") else "private"
+
+    def go(key):
+        _tl.zernio_key = key
+        try:
+            return _do_post(jd, video, meta, vis)
+        finally:
+            _tl.zernio_key = None
+
+    return with_keys("ZERNIO_API_KEY", go)
 
 
 def run_post():
@@ -2497,7 +2911,209 @@ def run_post():
         post_lock.release()
 
 
+# ---------------------------------------------------------------------------
+# Scenes (watching the video), splitting in two, and the per-video build
+# ---------------------------------------------------------------------------
+def stage_scenes(vid, seconds, bjd, sc, work):
+    """Returns (scenes, visuals, owner, frames, src). Uses the saved scenes when they exist."""
+    src = None
+    if sc:
+        scenes, visuals, owner = sc["scenes"], sc.get("visuals"), sc["owner"]
+        status(f"♻️ Reusing the {len(scenes)} scenes saved from the last run (tick 'Start fresh' to redo everything).")
+        return scenes, visuals, owner, [None] * len(scenes), src
+    scenes = visuals = owner = frames = None
+    if key_list("GEMINI_API_KEY") and os.environ.get("WATCH_WITH_GEMINI", "1") != "0":
+        status("👀 Asking Gemini to watch the video (it opens the YouTube link itself - no download needed) ...")
+        try:
+            scenes, visuals, owner = gemini_watch(vid["url"], seconds)
+            frames = [None] * len(scenes)
+            status(f"🎬 Gemini watched it: {len(scenes)} scenes, {len(set(owner))} different looks")
+        except Exception as e:
+            print(f"Gemini watch failed: {e}", flush=True)
+            scenes = None
+            status(f"⚠️ Gemini couldn't watch it ({esc(str(e)[:200])}). Trying the downloader instead ...")
+
+    if scenes is None:
+        fetch_cookies_from_github()
+        status("📝 Getting subtitles ...")
+        cues = yt_call(get_subtitles, vid["url"], work)
+        status(f"📝 {len(cues)} subtitle lines")
+
+        status("⬇️ Getting the video to watch it ...")
+        src = get_source_video(vid, seconds, work)
+        if not src:
+            status("⚠️ No way to download the video, so the bot can't watch it. "
+                   "Building from the script only (images are drawn from the narration, not the original frames).")
+
+        if src:
+            total = min(duration(src), seconds)
+            status("👀 Watching the video and finding scene changes ...")
+            scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
+        else:
+            total = min(float(seconds), max([b for _, b, _ in cues] + [0.0]))
+            scenes = attach_text(build_scenes([], total), cues)
+        if not scenes:
+            raise RuntimeError("no spoken lines found in that stretch of the video")
+
+        frames, owner, hashes = [], [], []
+        for i, (a, b, _) in enumerate(scenes):
+            check_kill()
+            if not src:
+                frames.append(None)
+                owner.append(i)
+                continue
+            fp = os.path.join(work, f"f{i:03d}.jpg")
+            grab_frame(src, (a + b) / 2, fp)
+            frames.append(fp)
+            h = dhash(fp)
+            same = (i > 0 and h is not None and hashes[i - 1] is not None
+                    and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
+            hashes.append(h)
+            owner.append(owner[i - 1] if same else i)
+        status(f"🎬 {len(scenes)} scenes, {len(set(owner))} different looks"
+               + (" (reusing images when the video didn't change)" if src else ""))
+    jwrite(bjd, "scenes.json", {"seconds": seconds, "scenes": scenes, "visuals": visuals, "owner": owner})
+    return scenes, visuals, owner, frames, src
+
+
+def split_point(scenes):
+    """Index of the scene that starts closest to the middle of the video (both halves keep at least one scene)."""
+    target = (scenes[0][0] + scenes[-1][1]) / 2
+    return min(range(1, len(scenes)), key=lambda i: abs(scenes[i][0] - target))
+
+
+def build_job(vid, jd, scenes, visuals, owner, frames, src, seconds, work, part, fresh):
+    """Stages 3-7 for ONE video (or one half of a split video). Returns the job dir."""
+    p, pn = part
+    plabel = f" (part {p}/{pn})" if pn > 1 else ""
+    old = None if fresh else jread(jd, "scenes.json")
+    if old and old.get("scenes") == scenes and old.get("seconds") == seconds:
+        jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"], "id": vid["id"], "part": [p, pn]})
+    else:
+        reset_job(jd, vid, part)
+        jwrite(jd, "scenes.json", {"seconds": seconds, "scenes": scenes, "visuals": visuals, "owner": owner})
+    for stale in ("done.json", "approved.json", "viewed.json", "probe.json"):
+        try:
+            os.remove(os.path.join(jd, stale))
+        except OSError:
+            pass
+    with open(LAST_JOB, "w") as f:
+        f.write(os.path.basename(jd))
+    n = len(scenes)
+    unique = sorted(set(owner))
+    if pn > 1:
+        status(f"🧩 Building part {p} of {pn} ({n} scenes) ...")
+
+    # ---- stage 3: rewrite (Groq) ----
+    check_kill()
+    rw = jread(jd, "rewrite.json")
+    if rw and len(rw.get("text") or []) == n:
+        new_text = rw["text"]
+        status("♻️ Reusing the saved rewrite.")
+    else:
+        status("✍️ Rewriting the narration with " + ("Groq" if (USE_GROQ and key_list("GROQ_API_KEY")) else "Gemini/Anthropic")
+               + " (same meaning, new structure) ...")
+        new_text = rewrite_scenes(scenes, vid["title"])
+        for stale in ("voice.json", "images.json"):
+            try:
+                os.remove(os.path.join(jd, stale))
+            except OSError:
+                pass
+        jwrite(jd, "rewrite.json", {"text": new_text})
+
+    # ---- stage 4: voice-over ----
+    check_kill()
+    audios = [os.path.join(jd, "audio", f"a{i:03d}.mp3") for i in range(n)]
+    vo = jread(jd, "voice.json")
+    if vo and vo.get("sig", voice_sig()) == voice_sig() and all(os.path.isfile(a) and os.path.getsize(a) > 500 for a in audios):
+        voice_used = vo.get("name", "")
+        status(f"♻️ Reusing the saved voice-over ({esc(voice_used)}).")
+    else:
+        status("🎙️ Generating voice-over ...")
+        voice_used, backup = make_voiceovers(new_text, audios)
+        jwrite(jd, "voice.json", {"name": voice_used, "sig": voice_sig(), "fallback": bool(backup)})
+        if backup:
+            status(f"🛑 A backup voice ({esc(voice_used)}) had to be used. The video will be built, but it will NOT auto-post: "
+                   "watch it and press Approve first.")
+
+    # ---- stage 5: images (style reference + real frame) ----
+    check_kill()
+    imgdir = os.path.join(jd, "images")
+    os.makedirs(imgdir, exist_ok=True)
+    images = {i: os.path.join(imgdir, f"img{i:03d}.png") for i in unique}
+    im = jread(jd, "images.json")
+    if im and all(os.path.isfile(pth) for pth in images.values()):
+        prompts = {int(k): v for k, v in (im.get("prompts") or {}).items()}
+        provider = im.get("provider", "")
+        status(f"♻️ Reusing the saved images from the bank ({esc(provider)}).")
+    else:
+        for fn_ in os.listdir(imgdir):
+            try:
+                os.remove(os.path.join(imgdir, fn_))
+            except OSError:
+                pass
+        frame_map = {}
+        if FRAME_REFS:
+            fsrc = src or get_source_video(vid, seconds, work)
+            if fsrc:
+                status("🖼️ Cutting a real frame for every scene (sent to Krea as a second reference) ...")
+                frame_map = make_frames(fsrc, scenes, unique, os.path.join(jd, "frames"))
+            else:
+                status("ℹ️ No source video available - drawing from the text + your style image only.")
+        status(f"🎨 Redrawing {len(unique)} frames ...")
+        prompts = {}
+
+        def get_prompt(i):
+            check_kill()
+            prompts[i] = visuals[i] if visuals and visuals[i] else describe_frame(frame_map.get(i) or frames[i], scenes[i][2])
+
+        with ThreadPoolExecutor(WORKERS) as ex:
+            list(ex.map(get_prompt, unique))
+        provider = make_images(unique, prompts, imgdir, frame_map)
+        if not provider:
+            raise RuntimeError("no image provider worked")
+        jwrite(jd, "images.json", {"provider": provider, "prompts": {str(k): v for k, v in prompts.items()},
+                                   "frames": len(frame_map)})
+
+    # ---- stage 6: final video (verified, so it plays on any phone / browser) ----
+    status("🎞️ Animating scenes and joining them ...")
+    parts = []
+    for i in range(n):
+        check_kill()
+        dst = os.path.join(work, f"s{i:03d}_{p}.mp4")
+        scene_clip(images[owner[i]], audios[i], i, dst)
+        parts.append(dst)
+    final = os.path.join(work, f"final_{p}.mp4")
+    concat(parts, final, work)
+    ok, note = verify_video(final)
+    if not ok:
+        status(f"⚠️ The joined video didn't pass the playback check ({esc(note)}). Re-encoding it ...")
+        concat_reencode(parts, final, work)
+        ok, note = verify_video(final)
+    jwrite(jd, "probe.json", {"ok": ok, "note": note})
+    status(("✅ Playback check passed: " if ok else "⚠️ Playback check FAILED: ") + esc(note))
+    shutil.move(final, os.path.join(jd, "final.mp4"))
+
+    lines = [f"SOURCE: {vid['title']}  ({vid['url']}){plabel}", f"VOICE: {voice_used}", f"IMAGES: {provider}", ""]
+    for i, (a, b, t) in enumerate(scenes):
+        lines += [f"--- Scene {i + 1}  [{a:.1f}s-{b:.1f}s]  image from scene {owner[i] + 1}",
+                  f"ORIGINAL : {t}", f"REWRITTEN: {new_text[i]}",
+                  f"IMAGE PROMPT: {prompts.get(owner[i], '')}", ""]
+    with open(os.path.join(jd, "script.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    jwrite(jd, "done.json", {"voice": voice_used, "images": provider})
+
+    mb = os.path.getsize(os.path.join(jd, "final.mp4")) / 1_000_000
+    status(f'✅ Video{esc(plabel)} ready ({mb:.1f} MB) - see the Results tab.')
+
+    # ---- stage 7: thumbnail + upload details ----
+    check_kill()
+    build_extras(vid, jd, new_text, part)
+    return jd
+
+
 def build_preview(handle, seconds=None, fresh=False, whole=False):
+    """Builds one video (or two halves). Returns the list of finished job dirs."""
     check_setup()
     seconds = max(20, int(seconds or PREVIEW_SECONDS))
     work = tempfile.mkdtemp(prefix="fl_")
@@ -2519,183 +3135,39 @@ def build_preview(handle, seconds=None, fresh=False, whole=False):
                 status(f"📏 Analysing the whole video ({seconds // 60}:{seconds % 60:02d}).")
 
         vkey = re.sub(r"[^\w-]", "", vid["id"]) or "video"
-        jd = os.path.join(JOBS_DIR, vkey)
-        os.makedirs(JOBS_DIR, exist_ok=True)                 # every video keeps its own saved job (the bank)
-        sc = None if fresh else jread(jd, "scenes.json")
+        want_split = bool(SPLIT_IN_TWO)
+        bjd = os.path.join(JOBS_DIR, vkey + ("_src" if want_split else ""))
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        sc = None if fresh else jread(bjd, "scenes.json")
         if sc and sc.get("seconds") == seconds and sc.get("scenes") and sc.get("owner"):
-            jwrite(jd, "video.json", {"title": vid["title"], "url": vid["url"], "id": vid["id"]})
+            jwrite(bjd, "video.json", {"title": vid["title"], "url": vid["url"], "id": vid["id"], "part": [1, 1]})
         else:
             sc = None
-            reset_job(jd, vid)
-        try:
-            os.remove(os.path.join(jd, "done.json"))
-        except OSError:
-            pass
-        with open(LAST_JOB, "w") as f:
-            f.write(vkey)
+            reset_job(bjd, vid)
 
-        # ---- stage 2: scenes ----
-        src = None
-        if sc:
-            scenes, visuals, owner = sc["scenes"], sc.get("visuals"), sc["owner"]
-            n = len(scenes)
-            frames = [None] * n
-            unique = sorted(set(owner))
-            status(f"♻️ Reusing the {n} scenes saved from the last run (tick 'Start fresh' to redo everything).")
-        else:
-            scenes = visuals = owner = frames = None
-            if GEMINI_API_KEY and os.environ.get("WATCH_WITH_GEMINI", "1") != "0":
-                status("👀 Asking Gemini to watch the video (it opens the YouTube link itself - no download needed) ...")
-                try:
-                    scenes, visuals, owner = gemini_watch(vid["url"], seconds)
-                    n = len(scenes)
-                    frames = [None] * n
-                    unique = sorted(set(owner))
-                    status(f"🎬 Gemini watched it: {n} scenes, {len(unique)} different looks")
-                except Exception as e:
-                    print(f"Gemini watch failed: {e}", flush=True)
-                    scenes = None
-                    status(f"⚠️ Gemini couldn't watch it ({esc(str(e)[:200])}). Trying the downloader instead ...")
+        scenes, visuals, owner, frames, src = stage_scenes(vid, seconds, bjd, sc, work)
 
-            if scenes is None:
-                fetch_cookies_from_github()
-                status("📝 Getting subtitles ...")
-                cues = yt_call(get_subtitles, vid["url"], work)
-                status(f"📝 {len(cues)} subtitle lines")
+        splits = [(0, len(scenes))]
+        if want_split:
+            if len(scenes) >= 2:
+                cut = split_point(scenes)
+                splits = [(0, cut), (cut, len(scenes))]
+                status(f"✂️ Splitting into 2 videos: part 1 = scenes 1-{cut}, part 2 = scenes {cut + 1}-{len(scenes)}.")
+            else:
+                status("ℹ️ Only one scene found, so it can't be split - building one video.")
 
-                status("⬇️ Getting the video to watch it ...")
-                src = get_source_video(vid, seconds, work)
-                if not src:
-                    status("⚠️ No way to download the video, so the bot can't watch it. "
-                           "Building from the script only (images are drawn from the narration, not the original frames).")
-
-                if src:
-                    total = min(duration(src), seconds)
-                    status("👀 Watching the video and finding scene changes ...")
-                    scenes = attach_text(build_scenes(detect_cuts(src, total), total), cues)
-                else:
-                    total = min(float(seconds), max([b for _, b, _ in cues] + [0.0]))
-                    scenes = attach_text(build_scenes([], total), cues)
-                if not scenes:
-                    raise RuntimeError("no spoken lines found in that stretch of the video")
-                n = len(scenes)
-
-                frames, owner, hashes = [], [], []
-                for i, (a, b, _) in enumerate(scenes):
-                    check_kill()
-                    if not src:
-                        frames.append(None)
-                        owner.append(i)
-                        continue
-                    fp = os.path.join(work, f"f{i:03d}.jpg")
-                    grab_frame(src, (a + b) / 2, fp)
-                    frames.append(fp)
-                    h = dhash(fp)
-                    same = (i > 0 and h is not None and hashes[i - 1] is not None
-                            and bin(h ^ hashes[i - 1]).count("1") <= SAME_IMAGE_BITS)
-                    hashes.append(h)
-                    owner.append(owner[i - 1] if same else i)
-                unique = sorted(set(owner))
-                status(f"🎬 {n} scenes, {len(unique)} different looks"
-                       + (" (reusing images when the video didn't change)" if src else ""))
-            jwrite(jd, "scenes.json", {"seconds": seconds, "scenes": scenes, "visuals": visuals, "owner": owner})
-
-        # ---- stage 3: rewrite ----
-        check_kill()
-        rw = jread(jd, "rewrite.json")
-        if rw and len(rw.get("text") or []) == n:
-            new_text = rw["text"]
-            status("♻️ Reusing the saved rewrite.")
-        else:
-            status("✍️ Rewriting the narration (same meaning, new structure) ...")
-            new_text = rewrite_scenes(scenes, vid["title"])
-            for stale in ("voice.json", "images.json"):
-                try:
-                    os.remove(os.path.join(jd, stale))
-                except OSError:
-                    pass
-            jwrite(jd, "rewrite.json", {"text": new_text})
-
-        # ---- stage 4: voice-over ----
-        check_kill()
-        audios = [os.path.join(jd, "audio", f"a{i:03d}.mp3") for i in range(n)]
-        vo = jread(jd, "voice.json")
-        if vo and vo.get("sig", voice_sig()) == voice_sig() and all(os.path.isfile(a) and os.path.getsize(a) > 500 for a in audios):
-            voice_used = vo.get("name", "")
-            status(f"♻️ Reusing the saved voice-over ({esc(voice_used)}).")
-        else:
-            status("🎙️ Generating voice-over ...")
-            voice_used = make_voiceovers(new_text, audios)
-            jwrite(jd, "voice.json", {"name": voice_used, "sig": voice_sig()})
-
-        # ---- stage 5: images (style reference + real frame) ----
-        check_kill()
-        imgdir = os.path.join(jd, "images")
-        os.makedirs(imgdir, exist_ok=True)
-        images = {i: os.path.join(imgdir, f"img{i:03d}.png") for i in unique}
-        im = jread(jd, "images.json")
-        if im and all(os.path.isfile(pth) for pth in images.values()):
-            prompts = {int(k): v for k, v in (im.get("prompts") or {}).items()}
-            provider = im.get("provider", "")
-            status(f"♻️ Reusing the saved images from the bank ({esc(provider)}).")
-        else:
-            for fn_ in os.listdir(imgdir):
-                try:
-                    os.remove(os.path.join(imgdir, fn_))
-                except OSError:
-                    pass
-            frame_map = {}
-            if FRAME_REFS:
-                fsrc = src or get_source_video(vid, seconds, work)
-                if fsrc:
-                    status("🖼️ Cutting a real frame for every scene (sent to Krea as a second reference) ...")
-                    frame_map = make_frames(fsrc, scenes, unique, os.path.join(jd, "frames"))
-                else:
-                    status("ℹ️ No source video available - drawing from the text + your style image only.")
-            status(f"🎨 Redrawing {len(unique)} frames ...")
-            prompts = {}
-
-            def get_prompt(i):
-                check_kill()
-                prompts[i] = visuals[i] if visuals and visuals[i] else describe_frame(frame_map.get(i) or frames[i], scenes[i][2])
-
-            with ThreadPoolExecutor(WORKERS) as ex:
-                list(ex.map(get_prompt, unique))
-            provider = make_images(unique, prompts, imgdir, frame_map)
-            if not provider:
-                raise RuntimeError("no image provider worked")
-            jwrite(jd, "images.json", {"provider": provider, "prompts": {str(k): v for k, v in prompts.items()},
-                                       "frames": len(frame_map)})
-
-        # ---- stage 6: final video ----
-        status("🎞️ Animating scenes and joining them ...")
-        parts = []
-        for i in range(n):
+        outs = []
+        for pi, (lo, hi) in enumerate(splits):
             check_kill()
-            dst = os.path.join(work, f"s{i:03d}.mp4")
-            scene_clip(images[owner[i]], audios[i], i, dst)
-            parts.append(dst)
-        final = os.path.join(work, "final.mp4")
-        concat(parts, final, work)
-        shutil.move(final, os.path.join(jd, "final.mp4"))
-
-        lines = [f"SOURCE: {vid['title']}  ({vid['url']})", f"VOICE: {voice_used}", f"IMAGES: {provider}", ""]
-        for i, (a, b, t) in enumerate(scenes):
-            lines += [f"--- Scene {i + 1}  [{a:.1f}s-{b:.1f}s]  image from scene {owner[i] + 1}",
-                      f"ORIGINAL : {t}", f"REWRITTEN: {new_text[i]}",
-                      f"IMAGE PROMPT: {prompts.get(owner[i], '')}", ""]
-        with open(os.path.join(jd, "script.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        jwrite(jd, "done.json", {"voice": voice_used, "images": provider})
-
-        mb = os.path.getsize(os.path.join(jd, "final.mp4")) / 1_000_000
-        status(f'✅ Preview ready ({mb:.1f} MB): <a href="/out/preview.mp4" target="_blank">watch</a> '
-               f'&middot; <a href="/out/script.txt" target="_blank">original vs rewritten script</a>')
-
-        # ---- stage 7: thumbnail + upload details ----
-        check_kill()
-        build_extras(vid, jd, new_text)
-        return os.path.join(jd, "final.mp4")
+            pn = len(splits)
+            name = f"{vkey}-p{pi + 1}" if pn > 1 else vkey
+            s_scenes = scenes[lo:hi]
+            s_vis = visuals[lo:hi] if visuals else None
+            s_owner = [(o - lo) if o >= lo else 0 for o in owner[lo:hi]]
+            s_frames = frames[lo:hi] if frames else [None] * (hi - lo)
+            outs.append(build_job(vid, os.path.join(JOBS_DIR, name), s_scenes, s_vis, s_owner, s_frames, src,
+                                  seconds, work, (pi + 1, pn), fresh))
+        return outs
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -2721,24 +3193,31 @@ def run_job(handle, seconds, fresh=False, whole=False):
         return
     job_running = True
     try:
-        build_preview(handle, seconds, fresh, whole)
+        outs = build_preview(handle, seconds, fresh, whole)
         if AUTO_POST:
             status("🚀 Auto-post is ON.")
-            try:
-                post_to_youtube()
-            except Killed:
-                raise
-            except Exception as e:
-                print(f"Auto-post failed: {type(e).__name__}: {e}", flush=True)
-                status(f"❌ The video is built but posting failed: {esc(str(e)[:400])}. You can press 'Post to YouTube now' to retry.")
+            for jd in outs:
+                title = (jread(jd, "video.json") or {}).get("title", "")[:50]
+                reasons = review_reasons(jd)
+                if reasons and not is_approved(jd):
+                    status(f"🛑 Auto-post SKIPPED for “{esc(title)}”: {esc('; '.join(reasons))}. "
+                           "Watch it on the Results tab, press Approve, then press Post.")
+                    continue
+                try:
+                    post_to_youtube(jd)
+                except Killed:
+                    raise
+                except Exception as e:
+                    print(f"Auto-post failed: {type(e).__name__}: {e}", flush=True)
+                    status(f"❌ Built, but posting failed: {esc(str(e)[:400])}. You can press 'Post' on the Results tab to retry.")
     except Killed:
         job_error[0] = "stopped by the kill switch"
-        status("⛔ Stopped by the kill switch. Everything made so far is saved - open the stages below to check it.")
+        status("⛔ Stopped by the kill switch. Everything made so far is saved - check it on the Results tab.")
     except Exception as e:
         print(f"Job failed: {type(e).__name__}: {e}", flush=True)
         job_error[0] = str(e)[:300] or "failed"
         if "Sign in to confirm" in str(e):
-            have = "Your cookies were rejected or expired - export fresh ones" if cookies_path() else "Upload a YouTube cookies.txt on the dashboard (or set YOUTUBE_COOKIES_B64)"
+            have = "Your cookies were rejected or expired - export fresh ones" if cookies_path() else "Upload a YouTube cookies.txt on the Settings tab (or set YOUTUBE_COOKIES_B64)"
             status(f"❌ YouTube thinks the server is a bot. {have}.")
         else:
             status(f"❌ {esc(str(e)[:400])}")
@@ -2748,71 +3227,135 @@ def run_job(handle, seconds, fresh=False, whole=False):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard
+# Dashboard (v3): sticky header with the kill switch, tabs, live pipeline, key manager
 # ---------------------------------------------------------------------------
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Faceless Bot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"><style>
-:root{--bg:#0b0b10;--panel:#14141c;--p2:#1b1b26;--border:#26263a;--text:#eaeaf2;--muted:#8a8aa0;--a:#ff3b5c;--a2:#7c5cff}
-*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Inter,Roboto,sans-serif;background:var(--bg);color:var(--text);padding:28px 18px 60px}
-.wrap{max-width:900px;margin:0 auto}h1{font-size:22px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin-bottom:20px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:16px}
-.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px}
-label{display:block;font-size:12.5px;color:var(--muted);margin:10px 0 6px}
-input[type=text],input[type=number],input[type=password]{background:var(--p2);border:1px solid var(--border);border-radius:8px;padding:9px 10px;color:var(--text);font:inherit;width:100%}
-button{background:linear-gradient(135deg,var(--a),var(--a2));color:#fff;border:0;padding:11px 16px;border-radius:10px;font-size:14px;font-weight:600;cursor:pointer;margin-top:14px}
-button.kill{background:#d8001f;width:100%;font-size:17px;padding:16px;margin-top:0;letter-spacing:.03em}
-button.small{padding:6px 10px;font-size:12px;margin-top:4px;background:#26263a}
-.feed{display:flex;flex-direction:column;gap:7px;max-height:360px;overflow-y:auto}
-.fi{background:#08080d;border:1px solid var(--border);border-radius:10px;padding:9px 12px;font-size:13px;line-height:1.5}
-a{color:var(--a2);text-decoration:none}.hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.5}
-.warn{border-color:rgba(255,59,92,.4);color:#ffb3c0;font-size:13px}.ok{border-color:rgba(60,200,120,.35);color:#b6f0cf;font-size:13px}
-video{width:100%;border-radius:12px;background:#000}
-img.ref{max-height:140px;border-radius:10px;border:1px solid var(--border);display:block;margin-bottom:8px}
-details{background:var(--p2);border:1px solid var(--border);border-radius:12px;margin-bottom:8px}
-summary{padding:12px 14px;cursor:pointer;font-size:14px;font-weight:600}
-.sb{padding:4px 14px 14px;font-size:13px;line-height:1.5}
-.sc{border-top:1px solid var(--border);padding:8px 0}.m{color:var(--muted);font-size:12px}
-.rw{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}.rw div{background:#08080d;border-radius:8px;padding:8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
-.grid img{width:100%;border-radius:8px;display:block}audio{width:100%;height:34px;margin-top:4px}
-@media(max-width:560px){.rw{grid-template-columns:1fr}}
-</style></head><body><div class="wrap">
-<h1>Faceless Bot</h1><div class="sub">Channel or video link in, rebuilt video out. Posting only happens when you allow it.</div>
-@@KILL@@
-@@WARN@@
-@@STORE@@
-<div class="card"><h2>1. Your animation style</h2>@@REF@@
-<input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"> <span id="upmsg" class="hint"></span>
-<div class="hint">Krea copies the look of this image. (The free Cloudflare fallback can't use it.)</div></div>
-<div class="card"><h2>YouTube cookies (only for the downloader fallback)</h2><div class="hint" style="margin:0 0 8px">@@COOKIES@@</div>
-<input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>
-@@KREA@@
-@@SETTINGS@@
-<div class="card"><h2>2. Build a preview</h2>
-<form method="POST" action="/run"><label>YouTube channel handle, channel link, OR a direct video link</label>
-<input type="text" name="handle" placeholder="@channelname  or  https://www.youtube.com/watch?v=..." value="@@HANDLE@@" required>
-<label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="whole" value="1" @@WHOLE@@ onchange="document.getElementById('secs').disabled=this.checked"> Analyse the whole video</label>
-<label>...or only the first N seconds</label><input id="secs" type="number" name="seconds" min="20" max="3600" value="@@SECS@@" @@SECSDIS@@>
-<label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="fresh" value="1"> Start fresh (ignore saved progress)</label>
-<label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" name="autopost" value="1" @@AUTOPOST@@> Post to YouTube automatically when it's done (<b>@@VIS@@</b>)</label>
-<button type="submit" id="runbtn">@@BTN@@</button></form>
-<div class="hint">If a run fails, running again on the same video continues from the saved stages instead of paying for them twice. With auto-post off you can post later from stage 8.</div></div>
-<div id="live">@@LIVE@@</div>
-@@BANK@@
-</div><script>
-async function up(i){const f=i.files[0];if(!f)return;document.getElementById('upmsg').textContent='Uploading...';
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0b10"><style>
+:root{--bg:#0a0b10;--s1:#12141c;--s2:#1a1d28;--s3:#222636;--bd:#272b3c;--tx:#eceef6;--mu:#8b90a8;--a:#ff4d6d;--a2:#7c5cff;
+--ok:#3ddc97;--warn:#ffb454;--bad:#ff5a5f;--r:14px}
+*{box-sizing:border-box}html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+padding-bottom:env(safe-area-inset-bottom)}
+a{color:#9d8cff;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--s3);padding:1px 6px;border-radius:6px;font-size:12.5px}
+header.top{position:sticky;top:0;z-index:50;background:rgba(10,11,16,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--bd);
+display:flex;align-items:center;gap:12px;padding:10px 16px;padding-top:calc(10px + env(safe-area-inset-top))}
+.brand{font-weight:800;letter-spacing:.2px;font-size:16px;display:flex;align-items:center;gap:8px}
+.logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--a),var(--a2));display:grid;place-items:center;font-size:14px}
+.sp{flex:1}.pill{font-size:12px;font-weight:700;padding:5px 11px;border-radius:999px;background:var(--s2);border:1px solid var(--bd);white-space:nowrap}
+.pill.ok{color:var(--ok)}.pill.bad{color:var(--bad);border-color:rgba(255,90,95,.45)}.pill.work{color:var(--warn)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--warn);margin-right:6px;animation:pulse 1.1s infinite}
+@keyframes pulse{50%{opacity:.25}}
+#killbox form{margin:0}
+button,.btn{font:inherit;font-weight:700;font-size:14px;border:0;border-radius:11px;padding:11px 18px;cursor:pointer;color:#fff;
+background:linear-gradient(135deg,var(--a),var(--a2));transition:transform .08s,opacity .15s;display:inline-block}
+.btn:hover{text-decoration:none}
+button:active{transform:scale(.97)}button:disabled{opacity:.4;cursor:not-allowed}
+button.kill{background:#d4001e;padding:9px 14px;font-size:13px;letter-spacing:.3px;box-shadow:0 0 0 1px rgba(255,255,255,.1) inset}
+button.ghost{background:var(--s3);color:var(--tx)}button.small{padding:6px 11px;font-size:12px;border-radius:9px}
+button.danger{background:#3a1218;color:#ff8c90}button.good{background:linear-gradient(135deg,#1fb97a,#3ddc97);color:#04140d}
+.ticker{font-size:12.5px;color:var(--mu);padding:7px 16px;border-bottom:1px solid var(--bd);background:var(--s1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ticker a{color:#9d8cff}
+.alerts{padding:0 16px}.alert{margin:12px 0 0;padding:12px 14px;border-radius:var(--r);border:1px solid var(--bd);background:var(--s1);font-size:13.5px}
+.alert.bad{border-color:rgba(255,90,95,.5);background:rgba(255,90,95,.07)}.alert.warn{border-color:rgba(255,180,84,.5);background:rgba(255,180,84,.07)}
+.alert form{display:flex;gap:8px;margin-top:9px}.alert input{flex:1}
+nav.tabs{position:sticky;top:53px;z-index:40;display:flex;gap:4px;overflow-x:auto;padding:8px 16px;background:var(--bg);border-bottom:1px solid var(--bd);scrollbar-width:none}
+nav.tabs::-webkit-scrollbar{display:none}
+nav.tabs button{background:transparent;color:var(--mu);padding:8px 15px;border-radius:999px;font-weight:600;white-space:nowrap}
+nav.tabs button.on{background:var(--s3);color:var(--tx)}
+main{max-width:920px;margin:0 auto;padding:16px}
+.tab{display:none}.tab.on{display:block;animation:fade .15s}@keyframes fade{from{opacity:.4}}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:var(--r);padding:18px;margin-bottom:14px}
+.card h2,.card h3{margin:0 0 12px;font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--mu);font-weight:700}
+.card.ok{border-color:rgba(61,220,151,.4)}.card.warn{border-color:rgba(255,180,84,.45)}.card.bad{border-color:rgba(255,90,95,.45)}
+.hint,.m{color:var(--mu);font-size:12.5px}.hint{margin-top:8px;line-height:1.5}
+label.f{display:block;font-size:12.5px;color:var(--mu);margin:12px 0 6px;font-weight:600}
+input[type=text],input[type=number],input[type=password],select,textarea{width:100%;background:var(--s2);border:1px solid var(--bd);color:var(--tx);
+border-radius:10px;padding:11px 12px;font:inherit}input:focus,select:focus{outline:2px solid rgba(124,92,255,.5);border-color:transparent}
+.seg{display:flex;background:var(--s2);border:1px solid var(--bd);border-radius:12px;padding:4px;gap:4px;margin-bottom:12px}
+.seg label{flex:1;text-align:center;padding:9px 6px;border-radius:9px;cursor:pointer;font-weight:600;font-size:13.5px;color:var(--mu)}
+.seg input{display:none}.seg input:checked+span{color:#fff}.seg label:has(input:checked){background:var(--s3);color:#fff}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}@media(max-width:600px){.grid2{grid-template-columns:1fr}}
+.sw{display:flex;align-items:center;gap:12px;padding:10px 12px;background:var(--s2);border:1px solid var(--bd);border-radius:12px;margin-top:10px;cursor:pointer}
+.sw input{display:none}.track{width:42px;height:24px;border-radius:99px;background:#3a3f55;position:relative;flex:none;transition:.15s}
+.knob{position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.15s}
+.sw input:checked+.track{background:linear-gradient(135deg,var(--a),var(--a2))}.sw input:checked+.track .knob{left:21px}
+.swt{font-size:13.5px;line-height:1.35}.swt small{display:block;color:var(--mu);font-size:12px}
+.bigbtn{width:100%;margin-top:16px;padding:15px;font-size:16px}
+.steps{display:flex;gap:6px;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}.steps::-webkit-scrollbar{display:none}
+.step{flex:1;min-width:74px;text-align:center;background:var(--s2);border:1px solid var(--bd);border-radius:11px;padding:9px 4px;font-size:11.5px;color:var(--mu)}
+.step b{display:block;font-size:17px;line-height:1.2}.step.done{color:var(--ok);border-color:rgba(61,220,151,.35)}
+.step.act{color:var(--warn);border-color:rgba(255,180,84,.6);animation:pulse 1.2s infinite}.step.err{color:var(--bad);border-color:rgba(255,90,95,.6)}
+.bar{height:6px;background:var(--s3);border-radius:99px;margin:12px 0 0;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--a),var(--a2));transition:width .4s}
+.feed{display:flex;flex-direction:column;gap:6px;max-height:340px;overflow-y:auto}
+.fi{background:#0a0c12;border:1px solid var(--bd);border-radius:10px;padding:8px 11px;font-size:13px}
+video{width:100%;border-radius:12px;background:#000;max-height:70vh}
+.acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.acts .btn,.acts button{padding:9px 14px;font-size:13px}
+.btn.ghost{background:var(--s3);color:var(--tx);text-decoration:none;display:inline-block;border-radius:11px}
+.chip{display:inline-block;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:99px;background:var(--s3);color:var(--mu);margin:0 4px 4px 0}
+.chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}.chip.bad{color:var(--bad)}
+details{background:var(--s2);border:1px solid var(--bd);border-radius:12px;margin-bottom:8px}
+summary{padding:12px 14px;cursor:pointer;font-weight:600;font-size:14px}.sb{padding:4px 14px 14px;font-size:13px}
+.sc{border-top:1px solid var(--bd);padding:9px 0}.rw{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}.rw>div{background:#0a0c12;border-radius:8px;padding:8px}
+@media(max-width:600px){.rw{grid-template-columns:1fr}}
+.gal{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}.gal img{width:100%;border-radius:9px;display:block}
+img.th{width:100%;max-width:360px;border-radius:10px;border:1px solid var(--bd);display:block;margin-bottom:8px}
+audio{width:100%;height:34px;margin-top:4px}
+.kp-h{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px}.kp-h b{font-size:15px}
+.krow{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--bd);flex-wrap:wrap;font-size:13px}
+.krow code{font-size:13px}.krow .st{flex:1;min-width:140px}.st.ok{color:var(--ok)}.st.bad{color:var(--bad)}.st.idle{color:var(--mu)}
+.krow form{margin:0}.addkey{display:flex;gap:8px;margin-top:10px}
+.jobs .job{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--bd)}
+.jobs .job img{width:112px;border-radius:8px;flex:none}.jobs .job .nt{width:112px;height:63px;border-radius:8px;background:var(--s3);flex:none}
+.job h4{margin:0 0 4px;font-size:14px}.job form{display:inline}
+.empty{text-align:center;color:var(--mu);padding:34px 10px}
+.upl{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.ref{max-height:130px;border-radius:10px;border:1px solid var(--bd)}
+.stick{position:sticky;bottom:10px;z-index:5}
+</style></head><body>
+<header class="top"><div class="brand"><span class="logo">▶</span><span>Faceless Bot</span></div><div class="sp"></div>
+<span id="pill">@@PILL@@</span><div id="killbox">@@KILL@@</div></header>
+<div class="ticker" id="ticker">@@TICKER@@</div>
+<div class="alerts" id="alert">@@ALERT@@</div>
+<nav class="tabs"><button data-tab="build" onclick="tab('build')">Build</button><button data-tab="results" onclick="tab('results')">Results</button>
+<button data-tab="keys" onclick="tab('keys')">Keys</button><button data-tab="settings" onclick="tab('settings')">Settings</button>
+<button data-tab="bank" onclick="tab('bank')">Bank</button></nav>
+<main>
+<section class="tab" id="tab-build">@@BUILD@@</section>
+<section class="tab" id="tab-results"><div id="results">@@RESULTS@@</div></section>
+<section class="tab" id="tab-keys">@@KEYS@@</section>
+<section class="tab" id="tab-settings">@@SETTINGS@@</section>
+<section class="tab" id="tab-bank">@@BANK@@</section>
+</main>
+<script>
+window.RUNNING=@@RUNNING@@;
+const TABS=['build','results','keys','settings','bank'];
+function tab(n){if(!TABS.includes(n))n='build';document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('on',t.id==='tab-'+n));
+document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===n));
+try{localStorage.setItem('tab',n)}catch(e){}history.replaceState(null,'','#'+n);window.scrollTo(0,0)}
+tab((location.hash||'').slice(1)||(function(){try{return localStorage.getItem('tab')}catch(e){return 'build'}})()||'build');
+function setHTML(sel,html,keep){const el=document.querySelector(sel);if(!el||html===undefined)return;
+if(el.dataset.h===html)return;el.dataset.h=html;
+const open=keep?[...el.querySelectorAll('details[open]')].map(d=>d.dataset.id):[];el.innerHTML=html;
+open.forEach(id=>{const d=el.querySelector('details[data-id="'+id+'"]');if(d)d.open=true})}
+async function poll(){try{const r=await fetch('/?partial=1',{cache:'no-store'});const j=await r.json();
+setHTML('#pill',j.pill);setHTML('#killbox',j.kill);setHTML('#ticker',j.ticker);setHTML('#alert',j.alert);
+setHTML('#progress',j.progress);setHTML('#activity',j.activity);
+const v=document.querySelector('#results video');if(!(v&&!v.paused))setHTML('#results',j.results,true);
+const b=document.getElementById('runbtn');if(b){b.disabled=j.run;b.textContent=j.run?'Working...':'Build'}
+if(j.run)setTimeout(poll,3000)}catch(e){setTimeout(poll,6000)}}
+if(window.RUNNING)poll();
+async function up(i){const f=i.files[0];if(!f)return;const m=document.getElementById('upmsg');m.textContent='Uploading...';
 const r=await fetch('/upload-ref?name='+encodeURIComponent(f.name),{method:'PUT',body:f});
-if(!r.ok){document.getElementById('upmsg').textContent='Failed: '+await r.text();return}location.reload()}
-async function upc(i){const f=i.files[0];if(!f)return;const r=await fetch('/upload-cookies',{method:'PUT',body:f});
-if(!r.ok){document.getElementById('upc').textContent='Failed: '+await r.text();return}location.reload()}
-let last="";
-async function poll(){try{const r=await fetch('/?partial=1');const run=r.headers.get('X-Running')==='1';const t=await r.text();
-if(t!==last){const open=[...document.querySelectorAll('#live details[open]')].map(d=>d.dataset.id);
-document.getElementById('live').innerHTML=t;last=t;
-document.querySelectorAll('#live details').forEach(d=>{if(open.includes(d.dataset.id))d.open=true})}
-document.getElementById('runbtn').textContent=run?'Working...':'Build preview';
-if(run)setTimeout(poll,4000)}catch(e){setTimeout(poll,6000)}}
-@@RELOAD@@
+if(!r.ok){m.textContent='Failed: '+await r.text();return}location.reload()}
+async function upc(i){const f=i.files[0];if(!f)return;const m=document.getElementById('upc');m.textContent='Uploading...';
+const r=await fetch('/upload-cookies',{method:'PUT',body:f});if(!r.ok){m.textContent='Failed: '+await r.text();return}location.reload()}
+document.addEventListener('timeupdate',e=>{const v=e.target;if(!v||v.tagName!=='VIDEO'||!v.dataset.job||v.dataset.sent)return;
+if(v.duration&&v.currentTime/v.duration>=0.8){v.dataset.sent=1;
+fetch('/viewed',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'id='+encodeURIComponent(v.dataset.job)}).then(()=>{
+const b=document.getElementById('approveBtn');if(b){b.disabled=false;b.textContent='✅ Approve this video'}})}},true);
+function mode(m){document.getElementById('lbl').textContent=m==='video'?'Link to ONE YouTube video':'Channel handle or link (uses its latest video)';
+document.getElementById('handle').placeholder=m==='video'?'https://www.youtube.com/watch?v=...':'@channelname'}
+function scope(s){document.getElementById('secs').disabled=(s==='whole')}
 </script></body></html>"""
 
 
@@ -2823,10 +3366,129 @@ def _mt(path):
         return 0
 
 
-def stages_html():
+def _vis():
+    v = POST_VISIBILITY.strip().lower()
+    return v if v in ("private", "unlisted", "public") else "private"
+
+
+def _slug(s):
+    return re.sub(r"[^\w.-]+", "-", s or "video").strip("-")[:60] or "video"
+
+
+def job_name(jd):
+    return os.path.basename(jd) if jd else ""
+
+
+def pill_html():
+    if PAUSED:
+        return '<span class="pill bad">⛔ Paused</span>'
+    if job_running:
+        return '<span class="pill work"><i class="dot"></i>Building</span>'
+    if post_running:
+        return '<span class="pill work"><i class="dot"></i>Posting</span>'
+    return '<span class="pill ok">● Ready</span>'
+
+
+def killbox_html():
+    if PAUSED:
+        return ('<form method="POST" action="/resume" onsubmit="return confirm(\'Resume the bot?\')">'
+                '<button class="good" type="submit">▶ Resume</button></form>')
+    return '<form method="POST" action="/kill"><button class="kill" type="submit">⛔ KILL</button></form>'
+
+
+def ticker_html():
+    with status_lock:
+        return status_feed[-1] if status_feed else "Ready."
+
+
+def alert_html():
+    out = ""
+    for name, label, why in keys_alerts():
+        out += (f'<div class="alert bad"><b>All {esc(label)} keys are failing</b> - {esc(why[:110])}'
+                f'<form method="POST" action="/keys/add"><input type="hidden" name="name" value="{esc(name)}">'
+                f'<input type="password" name="key" placeholder="Paste a new {esc(label)} key" autocomplete="off">'
+                '<button type="submit">Use it</button></form></div>')
+    jd = last_job_dir()
+    if jd and jread(jd, "done.json") and review_reasons(jd) and not is_approved(jd) and not jread(jd, "posted.json"):
+        out += ('<div class="alert warn">🛑 <b>This video needs your approval before it can post.</b> '
+                f'{esc("; ".join(review_reasons(jd)))}. <a href="#results" onclick="tab(\'results\')">Open Results</a></div>')
+    if PAUSED:
+        out += '<div class="alert bad">⛔ <b>The bot is paused.</b> Nothing builds or posts until you press Resume (top right). What it already made is saved.</div>'
+    return out
+
+
+STEP_LABELS = [("🔎", "Found"), ("👀", "Watched"), ("✍️", "Rewritten"), ("🎙️", "Voice"), ("🎨", "Images"),
+               ("🎞️", "Video"), ("🖼️", "Thumb"), ("🚀", "Posted")]
+
+
+def job_flags(jd):
+    vd = jread(jd, "video.json") or {}
+    meta = jread(jd, "meta.json")
+    return [bool(vd), bool(jread(jd, "scenes.json")), bool(jread(jd, "rewrite.json")), bool(jread(jd, "voice.json")),
+            bool(jread(jd, "images.json")), bool(jread(jd, "done.json")),
+            bool(meta) or os.path.isfile(os.path.join(jd, "thumbnail.jpg")), bool(jread(jd, "posted.json"))]
+
+
+def progress_html():
     jd = last_job_dir()
     if not jd:
-        return ""
+        return '<div class="empty">No build yet. Paste a link above and press Build.</div>'
+    flags = job_flags(jd)
+    pend = next((i for i, f in enumerate(flags) if not f), None)
+    vd = jread(jd, "video.json") or {}
+    part = vd.get("part") or [1, 1]
+    cells = ""
+    for i, (ic, lb) in enumerate(STEP_LABELS):
+        cls = "done" if flags[i] else ("err" if (i == pend and job_error[0]) else ("act" if (i == pend and busy()) else ""))
+        cells += f'<div class="step {cls}"><b>{"✅" if flags[i] else ic}</b>{lb}</div>'
+    pct = int(100 * sum(flags) / len(flags))
+    err = f'<div class="hint" style="color:var(--bad)">Stopped: {esc(job_error[0][:200])}</div>' if job_error[0] else ""
+    title = esc((vd.get("title") or "")[:80]) + (f' <span class="chip">part {part[0]}/{part[1]}</span>' if part[1] > 1 else "")
+    return f'<div class="m" style="margin-bottom:8px">{title}</div><div class="steps">{cells}</div><div class="bar"><i style="width:{pct}%"></i></div>{err}'
+
+
+def activity_html():
+    with status_lock:
+        items = list(status_feed[-25:])
+    return "".join(f'<div class="fi">{i}</div>' for i in reversed(items)) or '<div class="hint">Nothing yet.</div>'
+
+
+def build_html():
+    s = settings_load()
+    mode_v = s.get("LAST_MODE", "channel")
+    whole = s.get("LAST_WHOLE", "1") == "1"
+    sw = lambda n, t, h, c: (f'<label class="sw"><input type="checkbox" name="{n}" value="1"{" checked" if c else ""}>'
+                             f'<span class="track"><span class="knob"></span></span><span class="swt">{esc(t)}<small>{esc(h)}</small></span></label>')
+    opts = "".join(f'<option value="{v}"{" selected" if v == _vis() else ""}>{v}</option>' for v in ("private", "unlisted", "public"))
+    return (
+        '<div class="card"><h2>New build</h2><form method="POST" action="/run">'
+        '<div class="seg"><label><input type="radio" name="mode" value="channel" onchange="mode(this.value)"'
+        + (" checked" if mode_v == "channel" else "") + '><span>📺 Channel</span></label>'
+        '<label><input type="radio" name="mode" value="video" onchange="mode(this.value)"'
+        + (" checked" if mode_v == "video" else "") + '><span>🎯 One video link</span></label></div>'
+        f'<label class="f" id="lbl">{"Link to ONE YouTube video" if mode_v == "video" else "Channel handle or link (uses its latest video)"}</label>'
+        f'<input type="text" id="handle" name="handle" required autocomplete="off" placeholder="{"https://www.youtube.com/watch?v=..." if mode_v == "video" else "@channelname"}" '
+        f'value="{esc(s.get("LAST_HANDLE", ""))}">'
+        '<div class="seg" style="margin-top:12px"><label><input type="radio" name="scope" value="whole" onchange="scope(this.value)"'
+        + (" checked" if whole else "") + '><span>Whole video</span></label>'
+        '<label><input type="radio" name="scope" value="secs" onchange="scope(this.value)"' + ("" if whole else " checked")
+        + '><span>First N seconds</span></label></div>'
+        f'<input type="number" id="secs" name="seconds" min="20" max="3600" value="{PREVIEW_SECONDS}"{" disabled" if whole else ""}>'
+        + sw("split", "Split into two videos", "Cuts the video at the middle scene: Part 1 and Part 2 are built (and posted) separately", SPLIT_IN_TWO)
+        + sw("autopost", "Post to YouTube automatically when done", "A video that needed a backup voice is never auto-posted - you approve it first", AUTO_POST)
+        + f'<label class="f">Visibility when posting</label><select name="visibility">{opts}</select>'
+        + sw("fresh", "Start fresh", "Ignore everything saved for this video and rebuild it all", False)
+        + f'<button class="bigbtn" type="submit" id="runbtn"{" disabled" if busy() else ""}>{"Working..." if busy() else "Build"}</button></form>'
+        '<div class="hint">If a run fails, build again with the same link: it continues from the saved stages instead of paying twice.</div></div>'
+        '<div class="card"><h2>Progress</h2><div id="progress">' + progress_html() + '</div></div>'
+        '<div class="card"><h2>Activity</h2><div class="feed" id="activity">' + activity_html() + '</div></div>')
+
+
+def results_html():
+    jd = last_job_dir()
+    if not jd:
+        return '<div class="card"><div class="empty">Nothing built yet.</div></div>'
+    jid = job_name(jd)
     vd = jread(jd, "video.json") or {}
     sc = jread(jd, "scenes.json") or {}
     rw = jread(jd, "rewrite.json") or {}
@@ -2835,225 +3497,247 @@ def stages_html():
     dn = jread(jd, "done.json") or {}
     meta = jread(jd, "meta.json") or {}
     posted = jread(jd, "posted.json") or {}
+    probe = jread(jd, "probe.json") or {}
+    part = vd.get("part") or [1, 1]
     thumb = os.path.join(jd, "thumbnail.jpg")
-    scenes = sc.get("scenes") or []
-    visuals = sc.get("visuals") or []
-    owner = sc.get("owner") or []
+    fv = os.path.join(jd, "final.mp4")
+    scenes, visuals, owner = sc.get("scenes") or [], sc.get("visuals") or [], sc.get("owner") or []
     texts = rw.get("text") or []
     prompts = {int(k): v for k, v in (im.get("prompts") or {}).items()}
-    flags = [bool(vd), bool(scenes), bool(texts), bool(vo), bool(im), bool(dn),
-             bool(meta) or os.path.isfile(thumb), bool(posted)]
-    pend = next((i for i, f in enumerate(flags) if not f), None)
+    reasons = review_reasons(jd)
+    approved, viewed = is_approved(jd), is_viewed(jd)
 
-    def icon(i):
-        if flags[i]:
-            return "✅"
-        if i == pend and job_error[0]:
-            return "❌"
-        if i == pend and busy():
-            return "⏳"
-        return "⚪"
-
-    b0 = (f'<div>{esc(vd.get("title"))}</div><div class="m"><a href="{esc(vd.get("url"))}" target="_blank">'
-          f'{esc(vd.get("url"))}</a></div>') if vd else ""
-
-    b1 = ""
-    for i, (a, b, t) in enumerate(scenes):
-        vis = visuals[i] if i < len(visuals) and visuals[i] else ""
-        b1 += (f'<div class="sc"><b>Scene {i + 1}</b> <span class="m">{a:.1f}s-{b:.1f}s</span><div>{esc(t)}</div>'
-               + (f'<div class="m">Image prompt: {esc(vis)}</div>' if vis else "") + "</div>")
-
-    b2 = ""
-    for i, (a, b, t) in enumerate(scenes):
-        if i < len(texts):
-            b2 += (f'<div class="sc"><b>Scene {i + 1}</b><div class="rw"><div><span class="m">Original</span><br>{esc(t)}</div>'
-                   f'<div><span class="m">Rewritten</span><br>{esc(texts[i])}</div></div></div>')
-
-    b3 = ""
+    chips = ""
     if vo:
-        b3 = f'<div class="m">Voice used: {esc(vo.get("name"))}</div>'
+        chips += f'<span class="chip {"warn" if vo.get("fallback") else "ok"}">🎙️ {esc(vo.get("name"))}{" (backup)" if vo.get("fallback") else ""}</span>'
+    if im:
+        chips += f'<span class="chip ok">🎨 {esc(im.get("provider"))}</span>'
+    if probe:
+        chips += f'<span class="chip {"ok" if probe.get("ok") else "bad"}">{"▶ plays everywhere" if probe.get("ok") else "⚠ playback check failed"}</span>'
+    if posted:
+        chips += '<span class="chip ok">🚀 posted</span>'
+    elif reasons and not approved:
+        chips += '<span class="chip bad">🛑 needs approval</span>'
+    elif approved:
+        chips += '<span class="chip ok">✅ approved</span>'
+
+    sib = ""
+    if part[1] > 1:
+        base = jid.rsplit("-p", 1)[0]
+        for k in range(1, part[1] + 1):
+            n = f"{base}-p{k}"
+            if os.path.isdir(os.path.join(JOBS_DIR, n)) and n != jid:
+                sib += (f'<form method="POST" action="/bank/open" style="display:inline"><input type="hidden" name="id" value="{esc(n)}">'
+                        f'<button class="ghost small" type="submit">Open part {k}</button></form> ')
+    head = (f'<div class="card"><h2>Video{f" - part {part[0]}/{part[1]}" if part[1] > 1 else ""}</h2>'
+            f'<div style="font-weight:700;font-size:16px;margin-bottom:6px">{esc(meta.get("title") or vd.get("title") or "")}</div>{chips}{sib}')
+    if dn and os.path.isfile(fv):
+        slug = _slug(meta.get("title") or vd.get("title"))
+        head += (f'<video controls playsinline preload="metadata" data-job="{esc(jid)}" src="/jf/{esc(jid)}/final.mp4?v={_mt(fv)}"'
+                 + (f' poster="/jf/{esc(jid)}/thumbnail.jpg?v={_mt(thumb)}"' if os.path.isfile(thumb) else "") + '></video>'
+                 f'<div class="acts"><a class="btn ghost" href="/dl/{esc(jid)}/final.mp4" download="{esc(slug)}.mp4">⬇ Download video</a>'
+                 + (f'<a class="btn ghost" href="/dl/{esc(jid)}/thumbnail.jpg" download="{esc(slug)}-thumbnail.jpg">⬇ Thumbnail</a>' if os.path.isfile(thumb) else "")
+                 + f'<a class="btn ghost" href="/dl/{esc(jid)}/script.txt" download="{esc(slug)}-script.txt">⬇ Script</a></div>'
+                 + (f'<div class="hint">File check: {esc(probe.get("note"))}. '
+                    'If it still won\'t open on your device, tell me the device/app and the exact error.</div>' if probe else ""))
+    else:
+        head += '<div class="empty">The video isn\'t finished yet.</div>'
+    head += '</div>'
+
+    gate = ""
+    if dn and reasons and not posted:
+        if approved:
+            gate = '<div class="card ok"><h2>Review</h2>✅ You approved this video. It can be posted now.</div>'
+        else:
+            gate = ('<div class="card warn"><h2>Needs your approval</h2>'
+                    f'<div>{esc("; ".join(reasons))}.</div>'
+                    '<div class="hint">It will never auto-post like this. Watch it (at least 80%) and approve it, then press Post.</div>'
+                    f'<form method="POST" action="/approve"><input type="hidden" name="id" value="{esc(jid)}">'
+                    f'<button id="approveBtn" class="good" type="submit"{"" if viewed else " disabled"}>'
+                    f'{"✅ Approve this video" if viewed else "Watch the video first"}</button></form></div>')
+
+    post = ""
+    if posted:
+        post = ('<div class="card ok"><h2>YouTube</h2>Posted (' + esc(posted.get("visibility")) + ", " + esc(posted.get("status") or "sent") + "): "
+                + (f'<a href="{esc(posted.get("url"))}" target="_blank">{esc(posted.get("url"))}</a>' if posted.get("url") else "check your Zernio dashboard") + "</div>")
+    elif dn:
+        blocked = bool(reasons) and not approved
+        post = ('<div class="card"><h2>YouTube</h2>'
+                '<form method="POST" action="/post" onsubmit="return confirm(\'Post this video to YouTube now?\')">'
+                f'<input type="hidden" name="id" value="{esc(jid)}"><button type="submit"{" disabled" if blocked else ""}>🚀 Post to YouTube ({_vis()}, not made for kids)</button></form>'
+                + ('<div class="hint">Locked until you approve it above.</div>' if blocked else
+                   '<div class="hint">Sent through Zernio with the thumbnail and the title / description below.</div>') + '</div>')
+
+    d = ""
+    if meta or os.path.isfile(thumb):
+        inner = (f'<img class="th" src="/jf/{esc(jid)}/thumbnail.jpg?v={_mt(thumb)}">' if os.path.isfile(thumb) else "")
+        inner += (f'<div><b>{esc(meta.get("title"))}</b></div><div class="m" style="white-space:pre-wrap">{esc(meta.get("description"))}</div>'
+                  f'<div class="m">Tags: {esc(", ".join(meta.get("tags") or []))}</div>') if meta else ""
+        d += f'<details data-id="meta"><summary>🖼️ Thumbnail + title / description</summary><div class="sb">{inner}</div></details>'
+    if scenes:
+        b = "".join(f'<div class="sc"><b>Scene {i + 1}</b> <span class="m">{a:.1f}s-{c:.1f}s</span><div>{esc(t)}</div></div>'
+                    for i, (a, c, t) in enumerate(scenes))
+        d += f'<details data-id="scenes"><summary>👀 Scenes ({len(scenes)})</summary><div class="sb">{b}</div></details>'
+    if texts:
+        b = "".join(f'<div class="sc"><b>Scene {i + 1}</b><div class="rw"><div><span class="m">Original</span><br>{esc(t)}</div>'
+                    f'<div><span class="m">Rewritten</span><br>{esc(texts[i])}</div></div></div>'
+                    for i, (a, c, t) in enumerate(scenes) if i < len(texts))
+        d += f'<details data-id="rewrite"><summary>✍️ Original vs rewritten</summary><div class="sb">{b}</div></details>'
+    if vo:
+        b = ""
         for i in range(len(texts)):
             ap = os.path.join(jd, "audio", f"a{i:03d}.mp3")
             if os.path.isfile(ap):
-                b3 += (f'<div class="sc"><b>Scene {i + 1}</b><div>{esc(texts[i])}</div>'
-                       f'<audio controls preload="none" src="/job/audio/a{i:03d}.mp3?v={_mt(ap)}"></audio></div>')
-
-    b4 = ""
+                b += (f'<div class="sc"><b>Scene {i + 1}</b><div>{esc(texts[i])}</div>'
+                      f'<audio controls preload="none" src="/job/audio/a{i:03d}.mp3?v={_mt(ap)}"></audio></div>')
+        d += f'<details data-id="voice"><summary>🎙️ Voice-over ({esc(vo.get("name"))})</summary><div class="sb">{b}</div></details>'
     if im:
-        b4 = (f'<div class="m">Drawn with: {esc(im.get("provider"))} &middot; real frames used: {esc(im.get("frames", 0))} '
-              f'&middot; tap an image to open it full size</div><div class="grid">')
+        b = f'<div class="m">Drawn with {esc(im.get("provider"))} · real frames used: {esc(im.get("frames", 0))}</div><div class="gal">'
         for i in sorted(set(owner)):
             ip = os.path.join(jd, "images", f"img{i:03d}.png")
             if os.path.isfile(ip):
-                used = [str(k + 1) for k, o in enumerate(owner) if o == i]
                 u = f"/job/images/img{i:03d}.png?v={_mt(ip)}"
-                b4 += (f'<div><a href="{u}" target="_blank"><img loading="lazy" src="{u}"></a>'
-                       f'<div class="m">Scene {esc(", ".join(used))}: {esc(prompts.get(i, ""))}</div></div>')
-        b4 += "</div>"
-
-    b5 = ""
-    fv = os.path.join(jd, "final.mp4")
-    if dn and os.path.isfile(fv):
-        b5 = (f'<video controls preload="metadata" src="/out/preview.mp4?t={_mt(fv)}"></video>'
-              f'<div class="hint"><a href="/out/script.txt" target="_blank">Original vs rewritten script</a></div>')
-
-    b6 = ""
-    if os.path.isfile(thumb):
-        b6 += f'<a href="/job/thumbnail.jpg?v={_mt(thumb)}" target="_blank"><img class="ref" src="/job/thumbnail.jpg?v={_mt(thumb)}"></a>'
-    if meta:
-        b6 += (f'<div><b>{esc(meta.get("title"))}</b></div><div class="m" style="white-space:pre-wrap">{esc(meta.get("description"))}</div>'
-               f'<div class="m">Tags: {esc(", ".join(meta.get("tags") or []))}</div>')
-
-    b7 = ""
-    if posted:
-        b7 = (f'<div>Posted ({esc(posted.get("visibility"))}, {esc(posted.get("status") or "sent")}): '
-              + (f'<a href="{esc(posted.get("url"))}" target="_blank">{esc(posted.get("url"))}</a>' if posted.get("url")
-                 else "check your Zernio dashboard") + "</div>")
-    elif dn:
-        vis = POST_VISIBILITY.strip().lower()
-        vis = vis if vis in ("private", "unlisted", "public") else "private"
-        b7 = ('<form method="POST" action="/post" onsubmit="return confirm(\'Post this video to YouTube now?\')">'
-              f'<button type="submit">Post to YouTube now ({esc(vis)}, not made for kids)</button></form>'
-              '<div class="hint">Sent through Zernio with the thumbnail and the title / description above.</div>')
-
-    bodies = [b0, b1, b2, b3, b4, b5, b6, b7]
-    if job_error[0] and pend is not None:
-        bodies[pend] += f'<div class="m" style="color:#ffb3c0">Stopped here: {esc(job_error[0][:200])}</div>'
-
-    n = len(scenes)
-    vname = esc(vo.get("name")) if vo else ""
-    iname = esc(im.get("provider")) if im else ""
-    titles = ["1. Video found",
-              "2. Gemini watched the video" + (f" ({n} scenes)" if n else ""),
-              "3. Narration rewritten",
-              "4. Voice-over" + (f" ({vname})" if vo else ""),
-              "5. Images redrawn" + (f" ({iname})" if im else ""),
-              "6. Final video",
-              "7. Thumbnail + title / description",
-              "8. YouTube post"]
-    return "".join(f'<details data-id="s{i}"><summary>{icon(i)} {titles[i]}</summary><div class="sb">{bodies[i]}</div></details>'
-                   for i in range(8))
+                used = ", ".join(str(k + 1) for k, o in enumerate(owner) if o == i)
+                b += (f'<div><a href="{u}" target="_blank"><img loading="lazy" src="{u}"></a>'
+                      f'<div class="m">Scene {esc(used)}: {esc(prompts.get(i, ""))}</div></div>')
+        b += "</div>"
+        d += f'<details data-id="images"><summary>🎨 Images</summary><div class="sb">{b}</div></details>'
+    return head + gate + post + (f'<div class="card"><h2>Details</h2>{d}</div>' if d else "")
 
 
-def live_html():
-    with status_lock:
-        items = list(status_feed[-30:])
-    feed = "\n".join(f'<div class="fi">{i}</div>' for i in reversed(items)) or '<div class="hint">Nothing yet.</div>'
-    st = stages_html()
-    out = f'<div class="card"><h2>Stages (tap to open)</h2>{st}</div>' if st else ""
-    return out + f'<div class="card"><h2>Activity</h2><div class="feed">{feed}</div></div>'
+def keys_html():
+    out = ('<div class="card"><h2>How keys work</h2><div class="hint" style="margin:0">Every provider can have <b>several</b> keys. '
+           'Keys you paste here and keys from Railway variables (<code>GROQ_API_KEY</code>, <code>GROQ_API_KEY_2</code>, <code>GROQ_API_KEY_3</code> ...) '
+           'are pooled. If a key is invalid, out of credit or rate-limited, the bot moves to the next one by itself. '
+           'When a whole provider is failing you get a red banner with a box to paste a new key - no redeploy needed. '
+           'Newest website key is tried first. Keys are stored in plain text in your data folder, so set a <code>DASHBOARD_PASSWORD</code>.</div></div>')
+    for name, label, desc in KEY_PROVIDERS:
+        rows = key_rows(name)
+        env = " / ".join(KEY_ENV_ALIASES.get(name, [name]))
+        rhtml = ""
+        for r in rows:
+            rm = ""
+            if r["removable"]:
+                rm = (f'<form method="POST" action="/keys/remove" onsubmit="return confirm(\'Remove this key?\')">'
+                      f'<input type="hidden" name="name" value="{esc(name)}"><input type="hidden" name="kid" value="{esc(r["kid"])}">'
+                      '<button class="danger small" type="submit">Remove</button></form>')
+            rhtml += (f'<div class="krow"><code>{esc(r["mask"])}</code><span class="chip">{esc(r["source"])}</span>'
+                      f'<span class="st {r["cls"]}">{esc(r["status"])}</span>{rm}</div>')
+        retry = ""
+        if any(r["cls"] == "bad" for r in rows):
+            retry = (f'<form method="POST" action="/keys/retry" style="display:inline"><input type="hidden" name="name" value="{esc(name)}">'
+                     '<button class="ghost small" type="submit">Retry failed keys</button></form>')
+        out += (f'<div class="card"><div class="kp-h"><b>{esc(label)}</b><span class="chip {"ok" if rows else "bad"}">{len(rows)} key{"s" if len(rows) != 1 else ""}</span>{retry}</div>'
+                f'<div class="m">{esc(desc)}</div>{rhtml or "<div class=hint>No key yet.</div>"}'
+                f'<form method="POST" action="/keys/add" class="addkey"><input type="hidden" name="name" value="{esc(name)}">'
+                f'<input type="password" name="key" placeholder="Paste a {esc(label)} key" autocomplete="off"><button type="submit">Add</button></form>'
+                f'<div class="hint">Railway names: <code>{esc(env)}</code>, with _2, _3 ... for more.</div></div>')
+    return out
 
 
-def kill_card():
-    if PAUSED:
-        return ('<div class="card warn"><b>⛔ PAUSED.</b> The kill switch is on: nothing builds or posts until you resume. '
-                'What it already made is saved - open the stages below to check it, or clear it.'
-                '<form method="POST" action="/resume" style="display:inline" onsubmit="return confirm(\'Resume the bot?\')">'
-                '<button type="submit">Resume</button></form> '
-                '<form method="POST" action="/bank/clear" style="display:inline" '
-                'onsubmit="return confirm(\'Delete everything it made (jobs, images, videos)?\')">'
-                '<input type="hidden" name="what" value="all"><button type="submit" style="background:#26263a">Clear everything it made</button></form></div>')
-    return ('<div class="card"><form method="POST" action="/kill">'
-            '<button type="submit" class="kill">⛔ KILL SWITCH - stop everything now</button></form>'
-            '<div class="hint">Stops the build, kills ffmpeg, blocks posting, and keeps the bot paused (even after a redeploy) '
-            'until you press Resume. Image / voice requests already sent to the providers are still charged.</div></div>')
+def settings_html():
+    fields = {k: (lb, kd) for k, lb, kd in SETTING_FIELDS}
+    form = ""
+    for gname, keys in SETTING_GROUPS:
+        body = ""
+        for k in keys:
+            lb, kd = fields[k]
+            cur = globals()[k]
+            if kd == "bool":
+                body += (f'<label class="sw"><input type="checkbox" name="{k}" value="1"{" checked" if cur else ""}>'
+                         f'<span class="track"><span class="knob"></span></span><span class="swt">{esc(lb)}</span></label>')
+            elif kd == "secret":
+                ph = ("saved ····" + str(cur)[-4:]) if cur else "not set"
+                body += (f'<label class="f">{esc(lb)} <span class="m">(blank = keep, "-" = clear)</span></label>'
+                         f'<input type="password" name="{k}" placeholder="{esc(ph)}" autocomplete="off">')
+            elif k == "POST_VISIBILITY":
+                o = "".join(f'<option value="{v}"{" selected" if v == _vis() else ""}>{v}</option>' for v in ("private", "unlisted", "public"))
+                body += f'<label class="f">{esc(lb)}</label><select name="{k}">{o}</select>'
+            else:
+                body += f'<label class="f">{esc(lb)}</label><input type="text" name="{k}" value="{esc(cur)}">'
+        form += f'<div class="card"><h2>{esc(gname)}</h2>{body}</div>'
+    ref = (f'<img class="ref" src="/ref?t={int(time.time())}">' if reference_path() else '<div class="hint">No reference image yet.</div>')
+    ck = ("Cookies loaded." if cookies_path() else "No cookies (not needed while Gemini watches and Vid Kraken downloads).")
+    return (store_card()
+            + '<form method="POST" action="/settings">' + form + '<div class="stick"><button class="bigbtn" type="submit">Save settings</button></div></form>'
+            '<div class="card"><h2>Your animation style (reference image)</h2><div class="upl">' + ref +
+            '<input type="file" accept="image/png,image/jpeg,image/webp" onchange="up(this)"><span id="upmsg" class="hint"></span></div>'
+            '<div class="hint">Krea copies the look of this image. The free Cloudflare fallback can\'t use it.</div></div>'
+            + krea_card() +
+            '<div class="card"><h2>YouTube cookies (downloader fallback only)</h2><div class="hint" style="margin:0 0 8px">' + ck + '</div>'
+            '<input type="file" accept=".txt" onchange="upc(this)"> <span id="upc" class="hint"></span></div>')
 
 
-def bank_card():
+def store_card():
+    s = storage_status()
+    if s:
+        return ('<div class="card ok">💾 Settings, keys, style image and Krea login survive redeploys: ' + esc(", ".join(s)) + ".</div>")
+    return ('<div class="card warn">⚠️ Everything saved here (keys too) is lost on every redeploy. Fix: Railway → your service → Settings → '
+            'Volumes → add a volume mounted at <code>/data</code> (also keeps the video + image banks). '
+            'Or set <code>BACKUP_REPO</code> (a PRIVATE GitHub repo) + <code>GITHUB_TOKEN</code> (settings and keys only, not the banks).</div>')
+
+
+def bank_html():
     rows = ""
-    cur = os.path.basename(last_job_dir() or "")
+    cur = job_name(last_job_dir())
     try:
         dirs = sorted(os.listdir(JOBS_DIR), key=lambda d: os.path.getmtime(os.path.join(JOBS_DIR, d)), reverse=True)
     except OSError:
         dirs = []
     for d in dirs:
         jd = os.path.join(JOBS_DIR, d)
-        if not os.path.isdir(jd):
+        if not os.path.isdir(jd) or d.endswith("_src"):
             continue
         vd = jread(jd, "video.json") or {}
-        tags = (" &middot; viewing" if d == cur else "") + (" &middot; posted" if jread(jd, "posted.json") else "")
-        rows += (f'<div class="sc"><b>{esc((vd.get("title") or d)[:70])}</b> <span class="m">{dir_mb(jd):.0f} MB{tags}</span><br>'
-                 f'<form method="POST" action="/bank/open" style="display:inline"><input type="hidden" name="id" value="{esc(d)}">'
-                 '<button class="small" type="submit">Open</button></form> '
-                 f'<form method="POST" action="/bank/delete" style="display:inline" onsubmit="return confirm(\'Delete this saved job?\')">'
-                 f'<input type="hidden" name="id" value="{esc(d)}"><button class="small" type="submit">Delete</button></form></div>')
+        part = vd.get("part") or [1, 1]
+        tp = os.path.join(jd, "thumbnail.jpg")
+        img = f'<img src="/jf/{esc(d)}/thumbnail.jpg?v={_mt(tp)}">' if os.path.isfile(tp) else '<div class="nt"></div>'
+        badges = ""
+        if d == cur:
+            badges += '<span class="chip ok">viewing</span>'
+        if part[1] > 1:
+            badges += f'<span class="chip">part {part[0]}/{part[1]}</span>'
+        if jread(jd, "posted.json"):
+            badges += '<span class="chip ok">posted</span>'
+        elif jread(jd, "done.json") and review_reasons(jd) and not is_approved(jd):
+            badges += '<span class="chip bad">needs approval</span>'
+        rows += (f'<div class="job">{img}<div><h4>{esc((vd.get("title") or d)[:80])}</h4>{badges}<span class="m">{dir_mb(jd):.0f} MB</span><br>'
+                 f'<form method="POST" action="/bank/open" onsubmit="try{{localStorage.setItem(\'tab\',\'results\')}}catch(e){{}}">'
+                 f'<input type="hidden" name="id" value="{esc(d)}"><button class="ghost small" type="submit">Open</button></form> '
+                 f'<form method="POST" action="/bank/delete" onsubmit="return confirm(\'Delete this saved video?\')">'
+                 f'<input type="hidden" name="id" value="{esc(d)}"><button class="danger small" type="submit">Delete</button></form></div></div>')
     vids = ""
     try:
         for n in sorted(os.listdir(VBANK_DIR)):
-            if not n.endswith(".json"):
-                vids += f'<div class="m">{esc(n)} &middot; {os.path.getsize(os.path.join(VBANK_DIR, n)) / 1_000_000:.0f} MB</div>'
+            if n.endswith((".json", ".part")):
+                continue
+            vid_id = n.rsplit(".", 1)[0]
+            vids += (f'<div class="krow"><code>{esc(n)}</code><span class="m">{os.path.getsize(os.path.join(VBANK_DIR, n)) / 1_000_000:.0f} MB</span>'
+                     f'<a class="btn ghost small" style="padding:6px 11px" href="/dl/source/{esc(vid_id)}">⬇ Download</a></div>')
     except OSError:
         pass
-    note = "" if volume_on() else ('<div class="hint" style="color:#ffb3c0">No Railway volume: the banks are wiped on every redeploy. '
-                                   'Add a volume mounted at /data to keep them.</div>')
-    return ('<div class="card"><h2>Banks (saved jobs, images, source videos)</h2>' + note +
-            (rows or '<div class="hint">No saved jobs yet.</div>') +
-            '<div class="m" style="margin-top:10px"><b>Source video bank</b> (so Vid Kraken is only used once per video)</div>' +
-            (vids or '<div class="hint">Empty.</div>') +
-            '<form method="POST" action="/bank/clear" onsubmit="return confirm(\'Delete these?\')">'
-            '<select name="what" style="background:#1b1b26;color:#eaeaf2;border:1px solid #26263a;border-radius:8px;padding:8px">'
-            '<option value="jobs">All saved jobs + images</option><option value="videos">Source video bank</option>'
-            '<option value="all">Everything</option></select> <button class="small" type="submit">Clear</button></form></div>')
-
-
-def store_card():
-    s = storage_status()
-    if s:
-        return ('<div class="card ok">&#128190; Your settings, style image, cookies and Krea login survive redeploys: '
-                + esc(", ".join(s)) + ".</div>")
-    return ('<div class="card warn">&#9888; Saved data is lost on every redeploy. Fix (pick one): '
-            '<b>1)</b> Railway: service &rarr; Settings &rarr; Volumes &rarr; add a volume mounted at <code>/data</code> '
-            '(also keeps the video + image banks). '
-            '<b>2)</b> Set <code>BACKUP_REPO</code> (a PRIVATE GitHub repo, <code>user/repo</code>) and <code>GITHUB_TOKEN</code> '
-            'in Railway variables (settings only, not the banks).</div>')
-
-
-def settings_card():
-    rows = ""
-    for key, label, kind in SETTING_FIELDS:
-        cur = globals()[key]
-        if kind == "bool":
-            rows += (f'<label style="display:flex;gap:8px;align-items:center;color:var(--text)">'
-                     f'<input type="checkbox" name="{key}" value="1"{" checked" if cur else ""}> {esc(label)}</label>')
-        elif kind == "secret":
-            ph = ("saved ····" + str(cur)[-4:]) if cur else "not set"
-            rows += (f'<label>{esc(label)} <span class="m">(blank = keep, "-" = clear)</span></label>'
-                     f'<input type="password" name="{key}" placeholder="{esc(ph)}" autocomplete="off">')
-        else:
-            rows += f'<label>{esc(label)}</label><input type="text" name="{key}" value="{esc(cur)}">'
-    return ('<div class="card"><h2>Settings (saved)</h2><details><summary>Keys, models, posting, voices and style</summary><div class="sb">'
-            '<form method="POST" action="/settings">' + rows +
-            '<button type="submit">Save settings</button></form>'
-            '<div class="hint">Saved values win over Railway variables. They take effect immediately.</div></div></details></div>')
+    note = "" if volume_on() else '<div class="alert warn" style="margin:0 0 10px">No Railway volume: the banks are wiped on every redeploy. Add a volume mounted at /data.</div>'
+    return ('<div class="card"><h2>Saved videos (job bank)</h2>' + note + '<div class="jobs">' + (rows or '<div class="empty">Nothing saved yet.</div>') + '</div></div>'
+            '<div class="card"><h2>Source video bank</h2><div class="hint" style="margin:0 0 6px">Kept so Vid Kraken is only used once per video.</div>'
+            + (vids or '<div class="hint">Empty.</div>') + '</div>'
+            '<div class="card"><h2>Clear</h2><form method="POST" action="/bank/clear" onsubmit="return confirm(\'Delete these?\')">'
+            '<select name="what"><option value="jobs">All saved videos + images</option><option value="videos">Source video bank</option>'
+            '<option value="all">Everything it made</option></select><button class="danger" style="margin-top:10px" type="submit">Clear</button></form></div>')
 
 
 def render_page():
-    warns = []
-    if not (GEMINI_API_KEY or ANTHROPIC_API_KEY):
-        warns.append("No Gemini key yet: add it under Settings below (free key at aistudio.google.com)")
-    if not (KREA_API_KEY or CF_IMAGE_URL or krea_connected()):
-        warns.append("No image provider: connect Krea below, or add a Krea API key / Cloudflare worker URL in Settings")
-    warn = "".join(f'<div class="card warn">&#9888; {esc(w)}</div>' for w in warns)
-    ref = f'<img class="ref" src="/ref?t={int(time.time())}">' if reference_path() else \
-        '<div class="hint" style="margin:0 0 8px">No reference image yet.</div>'
-    ck = ("Cookies loaded. If YouTube still blocks you, upload fresh ones." if cookies_path() else
-          "No cookies. Not needed while Gemini can watch the video and Vid Kraken can download it.")
-    vis = POST_VISIBILITY.strip().lower()
-    vis = vis if vis in ("private", "unlisted", "public") else "private"
-    rep_ = {"@@KILL@@": kill_card(), "@@BANK@@": bank_card(),
-            "@@STORE@@": store_card(), "@@SETTINGS@@": settings_card(), "@@KREA@@": krea_card(),
-            "@@COOKIES@@": ck, "@@WARN@@": warn, "@@REF@@": ref, "@@LIVE@@": live_html(),
-            "@@HANDLE@@": esc(settings_load().get("LAST_HANDLE", "")),
-            "@@SECS@@": str(PREVIEW_SECONDS),
-            "@@AUTOPOST@@": "checked" if AUTO_POST else "", "@@VIS@@": esc(vis),
-            "@@WHOLE@@": "checked" if settings_load().get("LAST_WHOLE", "1") == "1" else "",
-            "@@SECSDIS@@": "disabled" if settings_load().get("LAST_WHOLE", "1") == "1" else "",
-            "@@BTN@@": "Working..." if busy() else "Build preview",
-            "@@RELOAD@@": "poll();" if busy() else ""}
+    rep = {"@@PILL@@": pill_html(), "@@KILL@@": killbox_html(), "@@TICKER@@": ticker_html(), "@@ALERT@@": alert_html(),
+           "@@BUILD@@": build_html(), "@@RESULTS@@": results_html(), "@@KEYS@@": keys_html(),
+           "@@SETTINGS@@": settings_html(), "@@BANK@@": bank_html(), "@@RUNNING@@": "true" if busy() else "false"}
     page = PAGE
-    for k, v in rep_.items():
+    for k, v in rep.items():
         page = page.replace(k, v)
     return page
+
+
+def partial_json():
+    return json.dumps({"run": busy(), "pill": pill_html(), "kill": killbox_html(), "ticker": ticker_html(), "alert": alert_html(),
+                       "progress": progress_html(), "activity": activity_html(), "results": results_html()})
 
 
 def clear_banks(what):
@@ -3108,6 +3792,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -3116,7 +3801,8 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode() if length else ""
         return urllib.parse.parse_qs(raw, keep_blank_values=True)
 
-    def _serve_file(self, path):
+    def _serve_file(self, path, download=None):
+        """Serves a file with Range support (so videos seek and play on phones) and optional 'save as'."""
         if not path or not os.path.isfile(path):
             return self._send(404, b"not found")
         size = os.path.getsize(path)
@@ -3127,18 +3813,29 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 start = int(s) if s else max(0, size - int(e))
                 end = min(int(e) if (e and s) else size - 1, size - 1)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 code = 206
             except ValueError:
                 start, end, code = 0, size - 1, 200
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if path.endswith(".mp4"):
+            ctype = "video/mp4"
         if path.endswith(".txt"):
             ctype = "text/plain; charset=utf-8"
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
+        if download:
+            self.send_header("Content-Disposition", f'attachment; filename="{_slug(os.path.splitext(download)[0])}{os.path.splitext(download)[1]}"')
         if code == 206:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         try:
             with open(path, "rb") as f:
@@ -3172,22 +3869,26 @@ class Handler(BaseHTTPRequestHandler):
                 if q.get("error"):
                     raise RuntimeError((q.get("error_description") or q["error"])[0])
                 oauth_finish((q.get("code") or [""])[0], (q.get("state") or [""])[0])
-                status("🔑 Krea connected. Tap 'Test the model ladder' to check your credits work.")
+                status("🔑 Krea connected. Open Settings and tap 'Test the model ladder' to check your credits work.")
                 return self._redir("/")
             except Exception as e:
                 status(f"❌ Krea sign-in failed: {esc(str(e)[:300])}")
                 return self._send(500, f"Krea sign-in failed: {e}".encode())
         if path == "/":
             if "partial=1" in urllib.parse.urlparse(self.path).query:
-                body = live_html().encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Running", "1" if busy() else "0")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
+                return self._send(200, partial_json().encode(), "application/json; charset=utf-8")
             return self._send(200, render_page().encode(), "text/html; charset=utf-8")
+        m = re.match(r"^/(dl|jf)/([\w-]+)/(final\.mp4|thumbnail\.jpg|script\.txt)$", path)
+        if m:
+            jd = os.path.join(JOBS_DIR, m.group(2))
+            vd = jread(jd, "video.json") or {}
+            meta = jread(jd, "meta.json") or {}
+            nm = _slug(meta.get("title") or vd.get("title")) + {"final.mp4": ".mp4", "thumbnail.jpg": "-thumbnail.jpg", "script.txt": "-script.txt"}[m.group(3)]
+            return self._serve_file(os.path.join(jd, m.group(3)), nm if m.group(1) == "dl" else None)
+        m = re.match(r"^/dl/source/([\w-]+)$", path)
+        if m:
+            p, _meta = bank_find(m.group(1))
+            return self._serve_file(p, os.path.basename(p) if p else None)
         if path.startswith("/job/"):
             jd = last_job_dir()
             rel = urllib.parse.unquote(path[5:])
@@ -3279,15 +3980,55 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 status(f"❌ Couldn't save settings: {esc(str(e)[:200])}")
             return self._redir("/")
+        if ppath == "/keys/add":
+            f = self._form()
+            name = (f.get("name") or [""])[0]
+            try:
+                keys_add(name, (f.get("key") or [""])[0])
+                status(f"🔑 New {esc(name)} key saved. It is tried first from now on.")
+            except Exception as e:
+                status(f"❌ {esc(str(e)[:200])}")
+            return self._redir("/")
+        if ppath == "/keys/remove":
+            f = self._form()
+            name = (f.get("name") or [""])[0]
+            if name in KEY_NAMES:
+                keys_remove(name, (f.get("kid") or [""])[0])
+                status(f"🗑️ Removed a {esc(name)} key.")
+            return self._redir("/")
+        if ppath == "/keys/retry":
+            name = (self._form().get("name") or [""])[0]
+            key_reset(name if name in KEY_NAMES else None)
+            status(f"🔁 Failed {esc(name)} keys will be tried again.")
+            return self._redir("/")
+        if ppath == "/viewed":
+            d = re.sub(r"[^\w-]", "", (self._form().get("id") or [""])[0]) or job_name(last_job_dir())
+            jd = os.path.join(JOBS_DIR, d)
+            if d and os.path.isdir(jd):
+                jwrite(jd, "viewed.json", {"at": int(time.time())})
+            return self._send(200, b"ok")
+        if ppath == "/approve":
+            d = re.sub(r"[^\w-]", "", (self._form().get("id") or [""])[0]) or job_name(last_job_dir())
+            jd = os.path.join(JOBS_DIR, d)
+            if d and os.path.isdir(jd) and is_viewed(jd):
+                jwrite(jd, "approved.json", {"at": int(time.time())})
+                status("✅ Approved. You can post it now.")
+            else:
+                status("⚠️ Watch the video first (at least 80%), then approve it.")
+            return self._redir("/")
         if ppath == "/post":
+            d = re.sub(r"[^\w-]", "", (self._form().get("id") or [""])[0])
+            if d and os.path.isdir(os.path.join(JOBS_DIR, d)) and not busy():
+                with open(LAST_JOB, "w") as fh:
+                    fh.write(d)
             threading.Thread(target=run_post, daemon=True).start()
             return self._redir("/")
         if ppath == "/bank/open":
             d = re.sub(r"[^\w-]", "", (self._form().get("id") or [""])[0])
             if d and os.path.isdir(os.path.join(JOBS_DIR, d)) and not busy():
-                with open(LAST_JOB, "w") as f:
-                    f.write(d)
-                status(f"📂 Opened the saved job {esc(d)}.")
+                with open(LAST_JOB, "w") as fh:
+                    fh.write(d)
+                status(f"📂 Opened the saved video {esc(d)}.")
             elif busy():
                 status("⏳ Wait for the running job to finish before switching.")
             return self._redir("/")
@@ -3297,7 +4038,7 @@ class Handler(BaseHTTPRequestHandler):
                 status("⏳ Stop or wait for the running job before deleting.")
             elif d and os.path.isdir(os.path.join(JOBS_DIR, d)):
                 shutil.rmtree(os.path.join(JOBS_DIR, d), ignore_errors=True)
-                status(f"🗑️ Deleted the saved job {esc(d)}.")
+                status(f"🗑️ Deleted the saved video {esc(d)}.")
             return self._redir("/")
         if ppath == "/bank/clear":
             what = (self._form().get("what") or ["jobs"])[0]
@@ -3310,28 +4051,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, b"not found")
         f = self._form()
         handle = (f.get("handle") or [""])[0].strip()
+        mode_v = (f.get("mode") or ["channel"])[0]
         try:
             seconds = int((f.get("seconds") or [str(PREVIEW_SECONDS)])[0])
         except ValueError:
             seconds = PREVIEW_SECONDS
         fresh = bool((f.get("fresh") or [""])[0])
-        whole = bool((f.get("whole") or [""])[0])
+        whole = (f.get("scope") or ["whole"])[0] == "whole"
         autopost = bool((f.get("autopost") or [""])[0])
+        split = bool((f.get("split") or [""])[0])
+        vis = (f.get("visibility") or ["private"])[0]
         if PAUSED:
             status("⛔ The bot is PAUSED (kill switch). Press Resume first.")
+        elif handle and mode_v == "video" and not VIDEO_LINK_RE.search(handle):
+            status("❌ That doesn't look like a link to ONE video (youtube.com/watch?v=..., youtu.be/..., /shorts/...). "
+                   "Switch to Channel mode if it's a channel.")
         elif handle:
             try:
-                settings_update({"LAST_HANDLE": handle, "PREVIEW_SECONDS": str(seconds),
-                                 "LAST_WHOLE": "1" if whole else "0", "AUTO_POST": "1" if autopost else "0"})
+                settings_update({"LAST_HANDLE": handle, "LAST_MODE": mode_v, "PREVIEW_SECONDS": str(seconds),
+                                 "LAST_WHOLE": "1" if whole else "0", "AUTO_POST": "1" if autopost else "0",
+                                 "SPLIT_IN_TWO": "1" if split else "0", "POST_VISIBILITY": vis})
             except Exception as e:
                 print(f"couldn't save run settings: {e}", flush=True)
-            status(f"▶️ Preview started for {esc(handle)}" + (" (whole video)" if whole else f" (first {seconds}s)")
-                   + (", fresh start" if fresh else "") + (", will auto-post." if autopost else "."))
+            status(f"▶️ Build started for {esc(handle)}" + (" (whole video)" if whole else f" (first {seconds}s)")
+                   + (", split in two" if split else "") + (", fresh start" if fresh else "")
+                   + (", will auto-post." if autopost else "."))
             threading.Thread(target=run_job, args=(handle, seconds, fresh, whole), daemon=True).start()
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        self._redir("/")
 
 
 def main():
@@ -3340,7 +4086,7 @@ def main():
         init_storage()
         startup_update()
         out = build_preview(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
-        print("Done:", out)
+        print("Done:", ", ".join(out))
         return
     port = int(os.environ.get("PORT", 8080))
     load_cookies_env()
